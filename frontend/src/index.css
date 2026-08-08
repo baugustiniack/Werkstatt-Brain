@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+@theme {
+  /* Werkstatt-Theme (SPEC Kap. 5.4: #1e1e2e) */
+  --color-workshop-bg: #1e1e2e;
+  --color-workshop-panel: #282838;
+  --color-workshop-border: #3b3b52;
+  --color-workshop-text: #cdd6f4;
+  --color-workshop-muted: #8890a8;
+  --color-workshop-accent: #89b4fa;
+  --color-workshop-success: #a6e3a1;
+  --color-workshop-warning: #f9e2af;
+  --color-workshop-danger: #f38ba8;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background-color: var(--color-workshop-bg);
+  color: var(--color-workshop-text);
+  font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--color-workshop-border);
+  border-radius: 6px;
+}

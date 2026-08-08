@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" width="192" height="192">
+  <rect width="192" height="192" rx="24" fill="#1e1e2e" />
+  <g stroke="#89b4fa" stroke-width="6" fill="none" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M46 128 L96 40 L146 128 Z" />
+    <path d="M46 128 L146 128" />
+    <circle cx="96" cy="98" r="14" fill="#89b4fa" stroke="none" />
+  </g>
+  <text x="96" y="164" text-anchor="middle" font-family="monospace" font-size="20" fill="#cdd6f4">WB</text>
+</svg>

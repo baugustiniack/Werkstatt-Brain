@@ -1,0 +1,136 @@
+# Werkstatt-Brain – Phase 1 (SPEC Kap. 1.2)
+# Services: FastAPI, PostgreSQL, Qdrant, Redis
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: werkstatt-api
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./backend/app:/app/app
+      - ./agents:/app/agents
+      - ./sandbox:/app/sandbox:ro
+      - ./logs:/app/logs
+      - ./exports:/app/exports
+      - ./sandbox_workspace:/app/sandbox_workspace
+      - ./rules:/app/rules
+      - ./uploads:/data/uploads
+      - ./agent_logs:/data/agent_logs
+      - ./conversations:/data/conversations
+      - ./crawler_input:/data/crawler_input:ro
+      # Docker-Socket für das Sibling-Container-Pattern (Kap. 4 Sandbox Execution Service).
+      # Sicherheitshinweis: gewährt dem API-Container faktisch Root-Kontrolle über den
+      # Host-Docker-Daemon. Für Phase 2 (Kap. 1.2) via docker-socket-proxy einschränken.
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    networks:
+      - werkstatt-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: werkstatt-postgres
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-werkstatt}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-werkstatt_brain}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - werkstatt-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-werkstatt} -d ${POSTGRES_DB:-werkstatt_brain}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: werkstatt-qdrant
+    restart: unless-stopped
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - werkstatt-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: werkstatt-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - werkstatt-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Frontend (Kap. 5): Vite-Dev-Server für die Werkstatt-Brain-PWA ────────
+  frontend:
+    build:
+      context: ./frontend
+    container_name: werkstatt-frontend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Browser-seitig (client-side JS) – daher localhost statt Docker-DNS-Namen.
+      VITE_API_BASE_URL: http://localhost:${API_PORT:-8000}
+      VITE_WS_BASE_URL: ws://localhost:${API_PORT:-8000}
+    ports:
+      - "${FRONTEND_PORT:-5173}:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - api
+    networks:
+      - werkstatt-net
+
+  # ── Sandbox-Image (nur zum Bauen; Instanzen werden ephemer per
+  #    app.services.sandbox_runner über den Docker-Socket gestartet) ────────
+  sandbox:
+    build:
+      context: ./sandbox
+      dockerfile: Dockerfile
+    image: werkstatt-sandbox:latest
+    profiles:
+      - sandbox
+
+networks:
+  werkstatt-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  redis_data:

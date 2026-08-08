@@ -1,0 +1,32 @@
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Runtime artifacts
+logs/*.json
+exports/
+sandbox_workspace/
+uploads/
+agent_logs/
+conversations/
+crawler_input/
+rules/*.json
+*.step
+*.gcode
+*.stl
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
