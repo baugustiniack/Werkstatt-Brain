@@ -30,12 +30,17 @@ function ConceptImageCard({
   parts,
   interactive,
   onDecision,
+  onElaborate,
+  elaborating,
 }: {
   title: string;
   imageUrl: string | null;
   parts?: ContractParts;
   interactive?: boolean;
   onDecision?: (decision: ConceptDecision) => void;
+  /** Historisches Konzept: Ausarbeitung neu starten */
+  onElaborate?: () => void;
+  elaborating?: boolean;
 }) {
   const [mode, setMode] = useState<"view" | "revise">("view");
   const [feedback, setFeedback] = useState("");
@@ -145,6 +150,20 @@ function ConceptImageCard({
           )}
         </>
       )}
+
+      {!interactive && onElaborate && (
+        <div className="flex justify-end">
+          <button
+            type="button"
+            disabled={elaborating}
+            onClick={() => onElaborate()}
+            className="rounded-md bg-workshop-accent px-3 py-1.5 text-xs font-semibold text-workshop-bg disabled:opacity-40"
+            title="3D-Ausarbeitung für dieses Konzept starten"
+          >
+            {elaborating ? "Startet…" : "Ausarbeiten"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -173,6 +192,7 @@ export function ConversationPanel({
   const { data: detail, isFetching: detailFetching } = useConversation(activeConversationId);
   const createConv = useCreateConversation();
   const deleteConv = useDeleteConversation();
+  const [pendingDelete, setPendingDelete] = useState<{ id: string; title: string } | null>(null);
 
   const isBusy = cad.status === "connecting" || cad.status === "running" || cad.status === "escalation";
 
@@ -226,7 +246,7 @@ export function ConversationPanel({
       escalation: "Freigabe erforderlich",
       completed: "Fertig",
       failed: "Fehlgeschlagen",
-      cancelled: "Abgebrochen",
+      cancelled: "Pausiert",
       error: "Fehler",
     };
     return map[cad.status] ?? null;
@@ -237,12 +257,22 @@ export function ConversationPanel({
 
   const conceptArtifacts = useMemo(() => {
     const arts = (detail?.artifacts ?? []).filter((a) => a.kind === "concept_image");
-    // Während Live-Freigabe: gleiches Session-Artefakt nicht doppelt zeigen
+    // Während Live-Freigabe: nur die neueste Version derselben Session ausblenden
+    // (ältere Konzepte bleiben mit „Ausarbeiten“ sichtbar)
     if (showConcept && cad.sessionId) {
-      return arts.filter((a) => a.cad_session_id !== cad.sessionId);
+      const sameSession = arts.filter((a) => a.cad_session_id === cad.sessionId);
+      if (sameSession.length === 0) return arts;
+      const newestId = [...sameSession].sort((a, b) => b.created_at.localeCompare(a.created_at))[0]?.id;
+      return arts.filter((a) => a.id !== newestId);
     }
     return arts;
   }, [detail?.artifacts, showConcept, cad.sessionId]);
+
+  const handleElaborateConcept = async (artifactId: string) => {
+    if (!activeConversationId || isBusy) return;
+    await cad.elaborateConcept(activeConversationId, artifactId);
+    invalidateConversation(qc, activeConversationId);
+  };
 
   const ensureConversation = async (): Promise<string | null> => {
     if (activeConversationId) return activeConversationId;
@@ -275,9 +305,16 @@ export function ConversationPanel({
     onPromptChange("");
   };
 
-  const handleDeleteChat = async (id: string, event: MouseEvent) => {
-    event.stopPropagation();
+  const requestDeleteChat = (id: string, title: string, event?: MouseEvent) => {
+    event?.stopPropagation();
     if (isBusy && id === activeConversationId) return;
+    setPendingDelete({ id, title });
+  };
+
+  const confirmDeleteChat = async () => {
+    if (!pendingDelete) return;
+    const { id } = pendingDelete;
+    setPendingDelete(null);
     try {
       await deleteConv.mutateAsync(id);
       if (activeConversationId === id) {
@@ -291,6 +328,8 @@ export function ConversationPanel({
     }
   };
 
+  const messages = detail?.messages ?? [];
+
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
     if (isBusy || prompt.trim().length < 3) return;
@@ -302,12 +341,88 @@ export function ConversationPanel({
     invalidateConversation(qc, convId);
   };
 
-  const messages = detail?.messages ?? [];
+  const resumableFromHistory = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      const meta = m.meta as { resumable?: boolean; status?: string } | null;
+      if (meta?.resumable && m.cad_session_id) return m.cad_session_id;
+      if (meta?.status === "paused" && m.cad_session_id) return m.cad_session_id;
+    }
+    return null;
+  }, [messages]);
+
+  const resumeSessionId = cad.pausedSessionId || resumableFromHistory;
+  const canResume =
+    !isBusy &&
+    !!resumeSessionId &&
+    (cad.status === "cancelled" ||
+      !!cad.pausedSessionId ||
+      (["idle", "error", "failed"].includes(cad.status) && !!resumableFromHistory));
+
+  const handleResume = async () => {
+    if (!canResume || !resumeSessionId) return;
+    const convId = activeConversationId ?? (await ensureConversation());
+    await cad.resume(resumeSessionId, convId);
+    if (convId) invalidateConversation(qc, convId);
+  };
+
+  const timeline = useMemo(() => {
+    type Item =
+      | { kind: "message"; at: string; id: string; message: (typeof messages)[number] }
+      | { kind: "concept"; at: string; id: string; artifact: ConversationArtifact };
+    const items: Item[] = [
+      ...messages.map((m) => ({ kind: "message" as const, at: m.created_at, id: m.id, message: m })),
+      ...conceptArtifacts.map((a) => ({
+        kind: "concept" as const,
+        at: a.created_at,
+        id: a.id,
+        artifact: a,
+      })),
+    ];
+    return items.sort((a, b) => a.at.localeCompare(b.at));
+  }, [messages, conceptArtifacts]);
+
   const liveTitle = cad.escalation?.requirements_contract?.project_title ?? "Konzept-Entwurf";
   const liveImageUrl = resolveMediaUrl(cad.escalation?.concept_image_url);
 
   return (
-    <div className="flex h-full min-h-0 gap-2">
+    <div className="relative flex h-full min-h-0 gap-2">
+      {pendingDelete && (
+        <div
+          className="absolute inset-0 z-20 flex items-center justify-center bg-black/60 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-conv-title"
+        >
+          <div className="w-full max-w-sm rounded-lg border border-workshop-warning/70 bg-workshop-panel p-4 shadow-lg">
+            <h3 id="delete-conv-title" className="text-sm font-semibold text-workshop-text">
+              Unterhaltung löschen?
+            </h3>
+            <p className="mt-2 text-xs leading-relaxed text-workshop-muted">
+              „{pendingDelete.title}“ wird unwiderruflich gelöscht – inklusive Nachrichten, Konzeptfotos
+              und 3D-Artefakte dieses Chats. Inventar-Einträge bleiben erhalten.
+            </p>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPendingDelete(null)}
+                className="rounded-md border border-workshop-border px-3 py-1.5 text-xs font-semibold text-workshop-text hover:bg-workshop-bg"
+              >
+                Abbrechen
+              </button>
+              <button
+                type="button"
+                disabled={deleteConv.isPending}
+                onClick={() => void confirmDeleteChat()}
+                className="rounded-md bg-workshop-danger px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
+              >
+                {deleteConv.isPending ? "Lösche…" : "Endgültig löschen"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Chat-Liste */}
       <aside className="flex w-40 shrink-0 flex-col gap-2 border-r border-workshop-border pr-2 sm:w-48">
         <button
@@ -340,12 +455,12 @@ export function ConversationPanel({
                 <span
                   role="button"
                   tabIndex={0}
-                  title="Löschen"
-                  onClick={(e) => void handleDeleteChat(c.id, e)}
+                  title="Unterhaltung löschen"
+                  onClick={(e) => requestDeleteChat(c.id, c.title, e)}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter") void handleDeleteChat(c.id, e as unknown as MouseEvent);
+                    if (e.key === "Enter") requestDeleteChat(c.id, c.title);
                   }}
-                  className="shrink-0 text-workshop-muted opacity-0 hover:text-workshop-danger group-hover:opacity-100"
+                  className="shrink-0 text-workshop-muted opacity-0 hover:text-workshop-danger group-hover:opacity-100 focus:opacity-100"
                 >
                   ×
                 </span>
@@ -366,7 +481,22 @@ export function ConversationPanel({
             {statusHint ? ` · ${statusHint}` : ""}
             {detailFetching ? " · …" : ""}
           </span>
-          <StatusBadge status={cad.status} currentNode={cad.currentNode} />
+          <div className="flex shrink-0 items-center gap-2">
+            {activeConversationId && (
+              <button
+                type="button"
+                disabled={isBusy || deleteConv.isPending}
+                onClick={() =>
+                  requestDeleteChat(activeConversationId, detail?.title ?? "Unterhaltung")
+                }
+                className="rounded border border-workshop-border px-2 py-0.5 text-[10px] font-semibold text-workshop-muted hover:border-workshop-danger hover:text-workshop-danger disabled:opacity-40"
+                title="Diese Unterhaltung löschen"
+              >
+                Löschen
+              </button>
+            )}
+            <StatusBadge status={cad.status} currentNode={cad.currentNode} />
+          </div>
         </div>
 
         <div
@@ -380,27 +510,42 @@ export function ConversationPanel({
             </p>
           )}
 
-          {messages.map((m) => (
-            <div
-              key={m.id}
-              className={
-                m.role === "user"
-                  ? "ml-8 rounded-lg bg-workshop-accent/15 px-3 py-2 text-sm text-workshop-text"
-                  : "mr-8 rounded-lg border border-workshop-border bg-workshop-panel px-3 py-2 text-xs text-workshop-text"
-              }
-            >
-              {m.content}
-            </div>
-          ))}
-
-          {conceptArtifacts.map((art) => (
-            <div key={art.id} className="mr-4">
-              <ConceptImageCard
-                title={art.label || detail?.title || "Konzept-Foto"}
-                imageUrl={resolveMediaUrl(art.url)}
-              />
-            </div>
-          ))}
+          {timeline.map((item) => {
+            if (item.kind === "message") {
+              const m = item.message;
+              return (
+                <div
+                  key={m.id}
+                  className={
+                    m.role === "user"
+                      ? "ml-8 rounded-lg bg-workshop-accent/15 px-3 py-2 text-sm text-workshop-text"
+                      : "mr-8 rounded-lg border border-workshop-border bg-workshop-panel px-3 py-2 text-xs text-workshop-text"
+                  }
+                >
+                  {m.content}
+                </div>
+              );
+            }
+            const art = item.artifact;
+            const meta = (art.meta ?? {}) as {
+              requirements_contract?: EscalationPayload["requirements_contract"];
+              project_title?: string;
+              ausarbeiten?: boolean;
+            };
+            return (
+              <div key={art.id} className="mr-4">
+                <ConceptImageCard
+                  title={meta.project_title || art.label || detail?.title || "Konzept-Foto"}
+                  imageUrl={resolveMediaUrl(art.url)}
+                  parts={meta.requirements_contract?.parts}
+                  onElaborate={
+                    meta.ausarbeiten === false ? undefined : () => void handleElaborateConcept(art.id)
+                  }
+                  elaborating={isBusy}
+                />
+              </div>
+            );
+          })}
 
           {isBusy && cad.status !== "escalation" && (
             <div className="mr-8 rounded-lg border border-dashed border-workshop-border px-3 py-2 text-xs text-workshop-muted">
@@ -441,6 +586,16 @@ export function ConversationPanel({
             className="resize-none rounded-md border border-workshop-border bg-workshop-bg p-3 text-sm text-workshop-text placeholder:text-workshop-muted focus:border-workshop-accent focus:outline-none disabled:opacity-60"
           />
           <div className="flex justify-end gap-2">
+            {canResume && (
+              <button
+                type="button"
+                onClick={() => void handleResume()}
+                className="rounded-md bg-workshop-accent px-4 py-2 text-sm font-semibold text-workshop-bg hover:opacity-90"
+                title="Pausierten Workflow lückenlos fortsetzen (Konzept bleibt erhalten)"
+              >
+                Fortsetzen
+              </button>
+            )}
             {isBusy && (
               <button
                 type="button"
@@ -453,7 +608,11 @@ export function ConversationPanel({
             <button
               type="submit"
               disabled={isBusy || prompt.trim().length < 3}
-              className="rounded-md bg-workshop-accent px-4 py-2 text-sm font-semibold text-workshop-bg transition disabled:cursor-not-allowed disabled:opacity-40"
+              className={`rounded-md px-4 py-2 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                canResume
+                  ? "border border-workshop-border text-workshop-text hover:bg-workshop-bg"
+                  : "bg-workshop-accent text-workshop-bg"
+              }`}
             >
               {isBusy ? "Läuft…" : "Senden"}
             </button>

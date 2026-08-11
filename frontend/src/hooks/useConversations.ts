@@ -26,6 +26,7 @@ export interface ConversationArtifact {
   part_index: number | null;
   cad_session_id: string | null;
   url: string;
+  meta?: Record<string, unknown> | null;
   created_at: string;
 }
 
@@ -52,6 +53,8 @@ export function useConversation(id: string | null) {
     queryKey: [KEY, id],
     queryFn: () => api.get<ConversationDetail>(`/api/v1/conversations/${id}`),
     enabled: !!id,
+    // Beim Refetch keine leere Liste flashen – Chat-Einträge bleiben sichtbar
+    placeholderData: (prev) => prev,
   });
 }
 

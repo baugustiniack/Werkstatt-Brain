@@ -69,6 +69,7 @@ def _ensure_conversation_concept_artifact(
     session_id: str,
     src: Path,
 ) -> str | None:
+    """Stellt sicher, dass das Konzept im Chat liegt – ohne bestehende Fotos zu löschen."""
     try:
         conv_uuid = uuid.UUID(conversation_id)
     except ValueError:
@@ -76,20 +77,26 @@ def _ensure_conversation_concept_artifact(
     if not conversation_store.get_conversation(db, conv_uuid):
         return None
 
+    from datetime import datetime, timezone
+
+    from app.services import crawler
+
+    file_hash = crawler.compute_file_hash(src)
     existing = (
         db.query(ConversationArtifact)
         .filter(
             ConversationArtifact.conversation_id == conv_uuid,
-            ConversationArtifact.cad_session_id == session_id,
             ConversationArtifact.kind == "concept_image",
         )
-        .first()
+        .all()
     )
-    if existing:
-        return f"/api/v1/conversations/artifacts/{existing.id}/file"
+    for art in existing:
+        if (art.meta or {}).get("file_hash") == file_hash:
+            return f"/api/v1/conversations/artifacts/{art.id}/file"
 
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
     dest = conversation_store._copy_into_conversation(  # noqa: SLF001
-        conv_uuid, src, filename=f"{session_id}_concept.png"
+        conv_uuid, src, filename=f"{session_id}_concept_{stamp}.png"
     )
     if not dest:
         return None
@@ -99,6 +106,7 @@ def _ensure_conversation_concept_artifact(
         kind="concept_image",
         file_path=str(dest),
         label="Konzept-Foto",
+        meta={"file_hash": file_hash, "ausarbeiten": True, "session_id": session_id},
     )
     db.add(art)
     db.commit()

@@ -80,8 +80,11 @@ AssetCategory = Literal[
 ]
 
 # Tags, die eine feste Kategorie erzwingen (kein Vision-Override zu tool/material)
-_FORCED_CONCEPT_TAGS = frozenset({"concept_image", "KI-Generiert", "ki-generiert", "product_concept"})
-_PROTECTED_TAGS = frozenset({"KI-Generiert", "concept_image", "from_chat"})
+_FORCED_CONCEPT_TAGS = frozenset({"concept_image", "product_concept"})
+_FORCED_CAD_MODEL_TAGS = frozenset({"generated_3d", "cad_model"})
+_PROTECTED_TAGS = frozenset(
+    {"KI-Generiert", "concept_image", "from_chat", "generated_3d", "cad_model"}
+)
 
 
 class VisionIngestResult(BaseModel):
@@ -219,9 +222,30 @@ def _normalize_category(value: Any) -> AssetCategory:
     return aliases.get(raw, "unknown")
 
 
+def _asset_forces_cad_model(asset: UnprocessedAsset) -> bool:
+    """KI-generierte STEP/STL aus dem Chat → immer cad_reference."""
+    from app.models.unprocessed_asset import AssetFileType
+
+    tags = {str(t) for t in (asset.tags or [])}
+    if tags & _FORCED_CAD_MODEL_TAGS:
+        return True
+    if asset.file_type in (AssetFileType.STEP, AssetFileType.STL, AssetFileType.F3D) and (
+        "KI-Generiert" in tags or "from_chat" in tags
+    ):
+        return True
+    notes = (asset.notes or "").lower()
+    if "ki-generiertes 3d-modell" in notes or "generated_3d" in notes:
+        return True
+    return False
+
+
 def _asset_forces_product_concept(asset: UnprocessedAsset) -> bool:
+    if _asset_forces_cad_model(asset):
+        return False
     tags = {str(t) for t in (asset.tags or [])}
     if tags & _FORCED_CONCEPT_TAGS:
+        return True
+    if "KI-Generiert" in tags and "concept_image" in tags:
         return True
     # Dateiname aus Konzept-Pipeline
     path = (asset.file_path or "").lower()
@@ -229,13 +253,21 @@ def _asset_forces_product_concept(asset: UnprocessedAsset) -> bool:
     if "_concept_" in path or path.endswith("_concept.png") or "konzept" in title:
         return True
     notes = (asset.notes or "").lower()
-    if "konzept-foto aus cad-session" in notes or "ki-generiert" in notes:
+    if "konzept-foto aus cad-session" in notes:
         return True
     return False
 
 
 def _apply_result_guards(asset: UnprocessedAsset, result: VisionIngestResult) -> VisionIngestResult:
     """Korrigiert sinnlose Klassifizierungen (z.B. Möbel-Konzept als material)."""
+    if _asset_forces_cad_model(asset):
+        result.category = "cad_reference"
+        result.tool_type = None
+        result.tags = list(
+            dict.fromkeys([*(result.tags or []), "KI-Generiert", "generated_3d", "cad_model", "cad_reference"])
+        )
+        return result
+
     if _asset_forces_product_concept(asset):
         result.category = "product_concept"
         result.tool_type = None
@@ -275,7 +307,14 @@ def _merge_notes(existing: str | None, description: str) -> str:
     keep_lines: list[str] = []
     for line in existing.splitlines():
         low = line.strip().lower()
-        if low.startswith("verknüpfte unterhaltung:") or low.startswith("konzept-foto aus cad-session"):
+        if (
+            low.startswith("verknüpfte unterhaltung:")
+            or low.startswith("konzept-foto aus cad-session")
+            or low.startswith("ki-generiertes 3d-modell")
+            or low.startswith("session:")
+            or low.startswith("teil-index:")
+            or low.startswith("projekt:")
+        ):
             keep_lines.append(line.strip())
         elif "inventar-db übernommen" in low:
             keep_lines.append(line.strip())
@@ -285,12 +324,19 @@ def _merge_notes(existing: str | None, description: str) -> str:
 
 
 def _preserve_protected_tags(existing: list[str] | None, incoming: list[str] | None) -> list[str]:
-    kept_protected = [t for t in (existing or []) if t in _PROTECTED_TAGS or str(t).startswith("conversation:")]
+    kept_protected = [
+        t
+        for t in (existing or [])
+        if t in _PROTECTED_TAGS
+        or str(t).startswith("conversation:")
+        or str(t).startswith("part:")
+    ]
     other_existing = [
         t
         for t in (existing or [])
         if t not in _PROTECTED_TAGS
         and not str(t).startswith("conversation:")
+        and not str(t).startswith("part:")
         and t not in {"heuristic_fallback", "cad_raw", "vision_error"}
     ]
     return list(dict.fromkeys([*kept_protected, *other_existing, *(incoming or [])]))
@@ -678,16 +724,27 @@ def ingest_asset(db: Session, asset: UnprocessedAsset) -> dict[str, Any]:
                 )
             result = analyze_asset_image(asset.file_path, classification_hint=hint)
         else:
+            hint_notes = asset.notes
+            if _asset_forces_cad_model(asset):
+                hint_notes = (
+                    (asset.notes or "")
+                    + "\n\nDies ist ein KI-generiertes 3D-Modell (STEP/STL) aus dem CAD-Chat. "
+                    "category MUSS 'cad_reference' sein. Tags: KI-Generiert, generated_3d."
+                ).strip()
             result = analyze_document_file(
                 asset.file_path,
                 file_type=asset.file_type.value,
                 title=asset.title,
-                existing_notes=asset.notes,
+                existing_notes=hint_notes,
             )
 
         result = _apply_result_guards(asset, result)
-        # Nur echte Werkzeuge/Rohware in strukturierte Tabellen – keine Konzepte
-        allow_route = result.category in ("tool", "material") and not _asset_forces_product_concept(asset)
+        # Nur echte Werkzeuge/Rohware in strukturierte Tabellen – keine Konzepte/KI-Modelle
+        allow_route = (
+            result.category in ("tool", "material")
+            and not _asset_forces_product_concept(asset)
+            and not _asset_forces_cad_model(asset)
+        )
         routing = route_vision_result(
             db,
             asset.file_path or f"manual:{asset.id}",
@@ -706,6 +763,16 @@ def ingest_asset(db: Session, asset: UnprocessedAsset) -> dict[str, Any]:
             )
             if isinstance(asset.vision_result, dict):
                 asset.vision_result = {**asset.vision_result, "category": "product_concept"}
+        # KI-3D-Modelle aus dem Chat
+        if _asset_forces_cad_model(asset) or result.category == "cad_reference":
+            if _asset_forces_cad_model(asset):
+                asset.tags = list(
+                    dict.fromkeys(
+                        [*(asset.tags or []), "KI-Generiert", "generated_3d", "cad_model", "from_chat"]
+                    )
+                )
+                if isinstance(asset.vision_result, dict):
+                    asset.vision_result = {**asset.vision_result, "category": "cad_reference"}
         asset.status = AssetStatus.INDEXED
         asset.error_message = None
         from datetime import datetime, timezone

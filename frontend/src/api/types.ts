@@ -85,8 +85,7 @@ export interface SandboxResult {
   export_paths: string[];
 }
 
-/** `reason === "concept_approval"` markiert das 2D-Sketch-Freigabe-Gate
- * (Nutzer-Feedback: Entwurf bestätigen, bevor die 3D-Ausarbeitung startet). */
+/** Freigabe-Gates: Konzept oder V&V (Frage / Bestätigung). */
 export interface EscalationPayload {
   reason: string;
   requirements_contract: RequirementsContract | null;
@@ -95,10 +94,38 @@ export interface EscalationPayload {
   iteration_count: number;
   concept_sketch_svg?: string | null;
   concept_image_url?: string | null;
+  vv_requirements?: {
+    title?: string;
+    phase?: string;
+    summary?: string;
+    requirements?: Array<{
+      id?: string;
+      text?: string;
+      priority?: string;
+      status?: string;
+    }>;
+    open_questions?: string[];
+    acceptance_criteria?: string[];
+    needs_user_alignment?: boolean;
+  } | null;
+  open_questions?: string[];
+  summary?: string | null;
+  /** Einzelne V&V-Klärungsfrage */
+  question?: string;
+  question_index?: number;
+  question_total?: number;
+  answered_so_far?: Array<{ question?: string; answer?: string }>;
+  draft_title?: string | null;
+  draft_summary?: string | null;
+  phase?: string;
+  qa_answers?: Array<{ question?: string; answer?: string }>;
 }
 
-/** Entscheidung des Nutzers auf eine `concept_approval`-Eskalation. */
-export type ConceptDecision = { decision: "approve" } | { decision: "revise"; feedback: string };
+/** Entscheidung des Nutzers auf eine Freigabe-Eskalation. */
+export type ConceptDecision =
+  | { decision: "approve" }
+  | { decision: "revise"; feedback: string }
+  | { decision: "answer"; answer: string };
 
 // ── backend/app/api/endpoints/cad.py ────────────────────────────────────────
 
@@ -120,6 +147,9 @@ export interface CadWorkflowResult {
   total_parts?: number;
   cancelled?: boolean;
   agent_transcript?: AgentTranscriptEntry[] | null;
+  montage_result?: Record<string, unknown> | null;
+  assembly_plan?: Record<string, unknown> | null;
+  assembly_manual?: Record<string, unknown> | null;
 }
 
 export interface AgentTranscriptEntry {
@@ -134,8 +164,12 @@ export interface AgentTranscriptEntry {
 /** Node-Namen der LangGraph-Topologie (agents/graph.py). */
 export type AgentNodeName =
   | "supervisor"
+  | "flexible_specialist"
+  | "vv_manager"
   | "concept_builder"
   | "inventory_manager"
+  | "fertigung_specialist"
+  | "montage_manager"
   | "builder_3d"
   | "validator"
   | "human_escalation";

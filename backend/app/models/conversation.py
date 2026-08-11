@@ -62,6 +62,8 @@ class ConversationArtifact(Base):
     file_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     label: Mapped[str | None] = mapped_column(String(255))
     part_index: Mapped[int | None] = mapped_column(Integer)
+    # Snapshot für „Ausarbeiten“ / Resume (Contract, Prompt, …) – nie löschen
+    meta: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     conversation: Mapped[Conversation] = relationship("Conversation", back_populates="artifacts")

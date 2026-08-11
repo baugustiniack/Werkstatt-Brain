@@ -123,41 +123,102 @@ def _asset_description(asset: UnprocessedAsset) -> str:
     return ""
 
 
-def _fetch_relevant_assets(db: Session, part: dict, *, limit: int = 8) -> list[dict]:
-    """Lädt indizierte Assets inkl. Beschreibung für den 3D-Builder-Kontext."""
+def _fetch_relevant_assets(
+    db: Session,
+    part: dict,
+    *,
+    conversation_id: str | None = None,
+    limit: int = 8,
+) -> list[dict]:
+    """Lädt indizierte Assets inkl. Beschreibung für den 3D-Builder-Kontext.
+
+    Priorität: KI-Modelle/Konzepte derselben Unterhaltung, dann Keyword-Match,
+    dann neueste beschriebene Assets. So erkennt der Inventory Manager
+    Chat-generierte STEP/STL (Tags KI-Generiert / generated_3d / conversation:…).
+    """
     keywords = _keywords_from_part(part)
-    query = (
+    base = (
         select(UnprocessedAsset)
         .where(UnprocessedAsset.status == AssetStatus.INDEXED)
-        .where(UnprocessedAsset.notes.isnot(None))
         .order_by(UnprocessedAsset.processed_at.desc().nullslast())
     )
 
     assets: list[UnprocessedAsset] = []
-    if keywords:
+    seen: set = set()
+
+    def _add(rows: list[UnprocessedAsset]) -> None:
+        for asset in rows:
+            if asset.id in seen:
+                continue
+            seen.add(asset.id)
+            assets.append(asset)
+            if len(assets) >= limit:
+                return
+
+    # 1) Dieselbe Chat-Unterhaltung (Konzept + generierte 3D-Modelle)
+    if conversation_id:
+        conv_tag = f"conversation:{conversation_id}"
+        # JSONB contains – PostgreSQL
+        try:
+            from sqlalchemy import cast, String
+
+            chat_rows = db.execute(
+                base.where(
+                    or_(
+                        UnprocessedAsset.notes.ilike(f"%{conversation_id}%"),
+                        cast(UnprocessedAsset.tags, String).ilike(f"%{conv_tag}%"),
+                        cast(UnprocessedAsset.tags, String).ilike("%generated_3d%"),
+                    )
+                ).limit(limit)
+            ).scalars().all()
+            # Prefer exact conversation match first
+            exact = [
+                a
+                for a in chat_rows
+                if conv_tag in (a.tags or []) or (conversation_id in (a.notes or ""))
+            ]
+            _add(exact)
+            if len(assets) < limit:
+                _add([a for a in chat_rows if a not in exact])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Chat-Asset-Suche fehlgeschlagen: %s", exc)
+
+    # 2) Keyword-Match auf Titel/Notizen
+    if len(assets) < limit and keywords:
         filters = []
         for kw in keywords:
             like = f"%{kw}%"
             filters.append(UnprocessedAsset.title.ilike(like))
             filters.append(UnprocessedAsset.notes.ilike(like))
-        matched = db.execute(query.where(or_(*filters)).limit(limit)).scalars().all()
-        assets.extend(matched)
+        matched = db.execute(
+            base.where(UnprocessedAsset.notes.isnot(None)).where(or_(*filters)).limit(limit)
+        ).scalars().all()
+        _add(matched)
 
+    # 3) Auffüllen mit neuesten beschriebenen / KI-Assets
     if len(assets) < limit:
-        # Auffüllen mit den neuesten beschriebenen Assets
-        extra = db.execute(query.limit(limit)).scalars().all()
-        seen = {a.id for a in assets}
-        for asset in extra:
-            if asset.id not in seen:
-                assets.append(asset)
-            if len(assets) >= limit:
-                break
+        from sqlalchemy import cast, String
+
+        extra = db.execute(
+            base.where(
+                or_(
+                    UnprocessedAsset.notes.isnot(None),
+                    cast(UnprocessedAsset.tags, String).ilike("%KI-Generiert%"),
+                )
+            ).limit(limit)
+        ).scalars().all()
+        _add(extra)
 
     results: list[dict] = []
     for asset in assets[:limit]:
         description = _asset_description(asset)
-        if not description:
+        if not description and "KI-Generiert" not in (asset.tags or []):
             continue
+        if not description:
+            description = (
+                f"KI-generiertes Inventar-Asset ({asset.file_type.value if asset.file_type else 'datei'}): "
+                f"{asset.title or asset.file_path}"
+            )
         vision = asset.vision_result if isinstance(asset.vision_result, dict) else {}
         results.append(
             {
@@ -168,6 +229,9 @@ def _fetch_relevant_assets(db: Session, part: dict, *, limit: int = 8) -> list[d
                 "category": vision.get("category"),
                 "tags": asset.tags or vision.get("tags") or [],
                 "description": truncate(description, 2000),
+                "from_chat": "from_chat" in (asset.tags or [])
+                or any(str(t).startswith("conversation:") for t in (asset.tags or [])),
+                "ai_generated": "KI-Generiert" in (asset.tags or []),
             }
         )
     return results
@@ -180,12 +244,13 @@ def inventory_manager_node(state: AgentState) -> AgentState:
     part = parts[idx] if idx < len(parts) else {}
     part_label = f"Teil {idx + 1}/{len(parts)} ('{part.get('name', 'Unbenannt')}')"
     constraints = part.get("material_tool_constraints", {})
+    conversation_id = state.get("conversation_id")
 
     db = SessionLocal()
     try:
         tool_match = _find_matching_tool(db, constraints.get("tool_diameter_mm"))
         stock_match = _find_matching_stock(db, constraints.get("material_type"), constraints.get("plate_thickness_mm"))
-        relevant_assets = _fetch_relevant_assets(db, part)
+        relevant_assets = _fetch_relevant_assets(db, part, conversation_id=conversation_id)
     finally:
         db.close()
 
@@ -267,6 +332,8 @@ def inventory_manager_node(state: AgentState) -> AgentState:
                     "rules_count": len(relevant_rules),
                     "assets_count": len(relevant_assets),
                     "asset_titles": [a.get("title") for a in relevant_assets],
+                    "conversation_id": conversation_id,
+                    "chat_linked_assets": sum(1 for a in relevant_assets if a.get("from_chat")),
                     "escalation_reasons": escalation_reasons,
                 },
                 to_agent="builder_3d",

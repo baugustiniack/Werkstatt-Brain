@@ -114,7 +114,13 @@ def persist_session_artifacts(
     *,
     message_id: uuid.UUID | None = None,
 ) -> list[ConversationArtifact]:
-    """Kopiert Konzeptfoto + STEP/STL der completed_parts in den Conversation-Ordner."""
+    """Kopiert Konzeptfoto + STEP/STL in den Conversation-Ordner.
+
+    Wichtig: Es wird nichts gelöscht oder überschrieben. Jedes neue Konzept-Foto
+    wird als eigener Artefakt-Eintrag versioniert abgelegt.
+    """
+    from datetime import datetime, timezone
+
     created: list[ConversationArtifact] = []
 
     existing = (
@@ -125,27 +131,56 @@ def persist_session_artifacts(
         )
         .all()
     )
-    existing_kinds = {(a.kind, a.part_index) for a in existing}
+    existing_export_keys = {
+        (a.kind, a.part_index)
+        for a in existing
+        if a.kind in ("step", "stl")
+    }
 
-    # Konzeptbild (bei Revision überschreiben / aktualisieren)
+    # Konzeptbild – immer neue Version (nie überschreiben), gleicher Inhalt nur einmal
+    from app.services import crawler
     from app.services.concept_image import concept_image_path
 
     img = concept_image_path(cad_session_id)
-    if img:
-        dest = _copy_into_conversation(conversation_id, img, filename=f"{cad_session_id}_concept.png")
-        if dest:
-            existing_img = next((a for a in existing if a.kind == "concept_image"), None)
-            if existing_img:
-                existing_img.file_path = str(dest)
-                existing_img.label = "Konzept-Foto"
-            else:
+    if img and img.is_file():
+        file_hash = crawler.compute_file_hash(img)
+        prior_concepts = (
+            db.query(ConversationArtifact)
+            .filter(
+                ConversationArtifact.conversation_id == conversation_id,
+                ConversationArtifact.kind == "concept_image",
+            )
+            .all()
+        )
+        hash_known = any((a.meta or {}).get("file_hash") == file_hash for a in prior_concepts)
+        if not hash_known:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+            dest = _copy_into_conversation(
+                conversation_id,
+                img,
+                filename=f"{cad_session_id}_concept_{stamp}.png",
+            )
+            if dest:
+                contract = values.get("requirements_contract") if isinstance(values.get("requirements_contract"), dict) else None
+                title = (contract or {}).get("project_title") or "Konzept-Foto"
                 art = ConversationArtifact(
                     conversation_id=conversation_id,
                     message_id=message_id,
                     cad_session_id=cad_session_id,
                     kind="concept_image",
                     file_path=str(dest),
-                    label="Konzept-Foto",
+                    label=str(title)[:255],
+                    meta={
+                        "ausarbeiten": True,
+                        "file_hash": file_hash,
+                        "project_title": title,
+                        "requirements_contract": contract,
+                        "user_prompt": values.get("user_prompt"),
+                        "concept_sketch_svg": values.get("concept_sketch_svg"),
+                        "vv_requirements": values.get("vv_requirements"),
+                        "concept_image_url": values.get("concept_image_url"),
+                        "session_id": cad_session_id,
+                    },
                 )
                 db.add(art)
                 created.append(art)
@@ -159,7 +194,7 @@ def persist_session_artifacts(
             kind = "step" if src.suffix.lower() == ".step" else "stl" if src.suffix.lower() == ".stl" else None
             if not kind:
                 continue
-            if (kind, idx) in existing_kinds:
+            if (kind, idx) in existing_export_keys:
                 continue
             dest = _copy_into_conversation(
                 conversation_id,
@@ -175,9 +210,11 @@ def persist_session_artifacts(
                     file_path=str(dest),
                     label=name,
                     part_index=idx,
+                    meta={"session_id": cad_session_id, "part_name": name},
                 )
                 db.add(art)
                 created.append(art)
+                existing_export_keys.add((kind, idx))
 
     # Fallback: top-level sandbox_result
     if not completed:
@@ -186,6 +223,8 @@ def persist_session_artifacts(
             src = Path(export)
             kind = "step" if src.suffix.lower() == ".step" else "stl" if src.suffix.lower() == ".stl" else None
             if not kind or not src.is_file():
+                continue
+            if (kind, 0) in existing_export_keys:
                 continue
             dest = _copy_into_conversation(
                 conversation_id, src, filename=f"{cad_session_id}_{kind}{src.suffix.lower()}"
@@ -199,9 +238,11 @@ def persist_session_artifacts(
                     file_path=str(dest),
                     label="Export",
                     part_index=0,
+                    meta={"session_id": cad_session_id},
                 )
                 db.add(art)
                 created.append(art)
+                existing_export_keys.add((kind, 0))
 
     if created or (img and img.is_file()):
         touch_conversation(db, db.get(Conversation, conversation_id))  # type: ignore[arg-type]

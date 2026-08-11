@@ -40,6 +40,7 @@ class ArtifactOut(BaseModel):
     part_index: int | None
     cad_session_id: str | None
     url: str
+    meta: dict[str, Any] | None = None
     created_at: str
 
 
@@ -156,6 +157,7 @@ def get_conversation(conversation_id: uuid.UUID) -> ConversationDetail:
                     part_index=a.part_index,
                     cad_session_id=a.cad_session_id,
                     url=_artifact_url(a.id),
+                    meta=a.meta,
                     created_at=a.created_at.isoformat(),
                 )
                 for a in sorted(conv.artifacts, key=lambda x: x.created_at)

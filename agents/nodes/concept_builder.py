@@ -160,9 +160,21 @@ def _fallback_decompose(user_prompt: str) -> dict:
 
 
 def _llm_decompose_request(
-    user_prompt: str, feedback: str | None, previous_parts: list[dict] | None
+    user_prompt: str,
+    feedback: str | None,
+    previous_parts: list[dict] | None,
+    *,
+    vv_requirements: dict | None = None,
+    advisory_notes: str | None = None,
 ) -> dict:
     user_message = f"Nutzeranfrage: {user_prompt}"
+    if vv_requirements:
+        user_message += (
+            "\n\nV&V-Requirements (verbindlich berücksichtigen):\n"
+            + json.dumps(vv_requirements, ensure_ascii=False)[:3500]
+        )
+    if advisory_notes:
+        user_message += f"\n\nFlexible-Specialist-Advisory:\n{advisory_notes[:1200]}"
     if feedback:
         prev_json = json.dumps({"parts": previous_parts or []}, ensure_ascii=False)
         user_message += (
@@ -180,10 +192,23 @@ def _decomposition_system_prompt() -> str:
     return _DECOMPOSITION_SYSTEM_PROMPT
 
 
-def _build_concept(user_prompt: str, feedback: str | None, previous_parts: list[dict] | None) -> dict:
+def _build_concept(
+    user_prompt: str,
+    feedback: str | None,
+    previous_parts: list[dict] | None,
+    *,
+    vv_requirements: dict | None = None,
+    advisory_notes: str | None = None,
+) -> dict:
     if is_llm_configured():
         try:
-            result = _llm_decompose_request(user_prompt, feedback, previous_parts)
+            result = _llm_decompose_request(
+                user_prompt,
+                feedback,
+                previous_parts,
+                vv_requirements=vv_requirements,
+                advisory_notes=advisory_notes,
+            )
             parts = result.get("parts") or []
             if not parts:
                 raise ValueError("LLM lieferte keine Teile-Liste.")
@@ -236,6 +261,61 @@ def concept_builder_node(state: AgentState) -> AgentState:
     idx = state.get("current_part_index", 0)
     is_concept_feedback = bool(refinement) and refinement.get("reason") == "concept_feedback"
 
+    # Resume / Idempotenz: vorhandenes Konzept nicht neu generieren
+    if existing_contract and not refinement:
+        if state.get("concept_approved"):
+            note = (
+                f"Vorhandenes freigegebenes Konzept „{existing_contract.get('project_title')}“ "
+                "wird weiterverwendet (kein Rebuild)."
+            )
+            return {
+                "refinement_request": None,
+                "human_approval_required": False,
+                "escalation_reason": None,
+                "current_agent": "concept_builder",
+                "messages": [{"role": "assistant", "content": f"[Concept Builder] {note}"}],
+                "agent_transcript": [
+                    make_entry(
+                        "concept_builder",
+                        "concept_reuse",
+                        note,
+                        detail={
+                            "project_title": existing_contract.get("project_title"),
+                            "parts_count": len(existing_contract.get("parts") or []),
+                            "concept_image_url": state.get("concept_image_url"),
+                        },
+                        to_agent="inventory_manager",
+                    )
+                ],
+            }
+        # Konzept vorhanden, noch nicht freigegeben → nur Freigabe-Gate
+        if state.get("concept_image_url") or existing_contract.get("parts"):
+            title = existing_contract.get("project_title") or "Konzept"
+            note = f"Vorhandenes Konzept „{title}“ – erneute Freigabe, ohne Neu-Generierung."
+            return {
+                "requirements_contract": existing_contract,
+                "concept_sketch_svg": state.get("concept_sketch_svg"),
+                "concept_image_url": state.get("concept_image_url"),
+                "concept_approved": False,
+                "refinement_request": None,
+                "human_approval_required": True,
+                "escalation_reason": "concept_approval",
+                "current_agent": "concept_builder",
+                "messages": [{"role": "assistant", "content": f"[Concept Builder] {note}"}],
+                "agent_transcript": [
+                    make_entry(
+                        "concept_builder",
+                        "concept_reuse_approval",
+                        note,
+                        detail={
+                            "project_title": title,
+                            "concept_image_url": state.get("concept_image_url"),
+                        },
+                        to_agent="human_escalation",
+                    )
+                ],
+            }
+
     if refinement and existing_contract and not is_concept_feedback:
         # Autonome Korrektur EINES Teils (topologischer Konflikt, Werkzeug-Substitution) –
         # der bereits freigegebene Entwurf/Sketch bleibt unverändert, keine Re-Freigabe nötig.
@@ -270,7 +350,15 @@ def concept_builder_node(state: AgentState) -> AgentState:
     feedback_text = refinement.get("feedback") if is_concept_feedback else None
     previous_parts = existing_contract.get("parts") if (is_concept_feedback and existing_contract) else None
 
-    concept = _build_concept(state["user_prompt"], feedback_text, previous_parts)
+    vv = state.get("vv_requirements") if isinstance(state.get("vv_requirements"), dict) else None
+    advisory = state.get("advisory_notes") if isinstance(state.get("advisory_notes"), str) else None
+    concept = _build_concept(
+        state["user_prompt"],
+        feedback_text,
+        previous_parts,
+        vv_requirements=vv,
+        advisory_notes=advisory,
+    )
     sketch_svg = render_concept_sketch_svg(concept["project_title"], concept["parts"])
 
     contract = {

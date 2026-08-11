@@ -51,9 +51,18 @@ function categoryOf(item: InventoryItem): string | null {
 
 function displayTags(item: InventoryItem): string[] {
   const tags = item.tags ?? [];
-  // conversation:uuid kompakt halten
+  // conversation:uuid / interne Flags kompakt halten; KI-Markierung separat anzeigen
   return tags
-    .filter((t) => !t.startsWith("conversation:") && t !== "from_chat" && t !== "concept_image")
+    .filter(
+      (t) =>
+        !t.startsWith("conversation:") &&
+        !t.startsWith("part:") &&
+        t !== "from_chat" &&
+        t !== "concept_image" &&
+        t !== "generated_3d" &&
+        t !== "cad_model" &&
+        t !== "KI-Generiert",
+    )
     .slice(0, 6);
 }
 
@@ -414,6 +423,9 @@ export function AssetLibrary() {
                       {categoryOf(item) && <span>{categoryOf(item)}</span>}
                       {item.tags?.includes("KI-Generiert") && (
                         <span className="text-workshop-accent">KI-Generiert</span>
+                      )}
+                      {item.tags?.includes("generated_3d") && (
+                        <span className="text-workshop-accent">3D-Modell</span>
                       )}
                       {needsAiScan(item) && <span className="text-workshop-warning">KI-Scan nötig</span>}
                     </div>

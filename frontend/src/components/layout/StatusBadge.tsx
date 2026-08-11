@@ -3,8 +3,12 @@ import type { CadRunStatus } from "../../api/useCadStream";
 
 const NODE_LABELS: Record<AgentNodeName, string> = {
   supervisor: "SUPERVISOR",
+  flexible_specialist: "FLEXIBLE_SPECIALIST",
+  vv_manager: "VV_MANAGER",
   concept_builder: "CONCEPT",
   inventory_manager: "FETCHING_INVENTORY",
+  fertigung_specialist: "FERTIGUNG",
+  montage_manager: "MONTAGE",
   builder_3d: "BUILDING_3D",
   validator: "VALIDATING_SANDBOX",
   human_escalation: "ESCALATION",
@@ -28,7 +32,7 @@ export function StatusBadge({ status, currentNode }: { status: CadRunStatus; cur
       : status === "completed"
         ? "COMPLETED"
         : status === "cancelled"
-          ? "CANCELLED"
+          ? "PAUSED"
           : status === "failed"
             ? "FAILED"
             : status === "error"

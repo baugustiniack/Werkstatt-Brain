@@ -4,6 +4,9 @@ Foto des fertigen Möbels in der richtigen Umgebung statt Teile-SVG als Hauptans
 Nutzt die OpenAI Images API, sofern ein Key konfiguriert ist (UI-Setting oder
 `.env`). Ohne Key/bei Fehler liefert `None` – der Workflow läuft weiter mit
 Textzusammenfassung + optionalem SVG-Fallback.
+
+Versionierte Ablage: jedes neue Foto bleibt erhalten (`{session}_{timestamp}.png`);
+`{session}.png` zeigt zusätzlich immer auf das neueste Foto (API-Kompatibilität).
 """
 
 from __future__ import annotations
@@ -11,6 +14,8 @@ from __future__ import annotations
 import base64
 import logging
 import re
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +29,16 @@ _SAFE_SESSION = re.compile(r"[^a-zA-Z0-9_-]+")
 
 def is_image_gen_configured() -> bool:
     return bool(settings_store.resolve_openai_api_key())
+
+
+def _safe_session_id(session_id: str) -> str:
+    return _SAFE_SESSION.sub("_", session_id)[:64] or "session"
+
+
+def _concepts_dir() -> Path:
+    path = Path(settings.uploads_dir) / "concepts"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _build_image_prompt(project_title: str, user_prompt: str, parts: list[dict[str, Any]]) -> str:
@@ -58,18 +73,20 @@ def generate_concept_image(
     user_prompt: str,
     parts: list[dict[str, Any]],
 ) -> str | None:
-    """Generiert ein Konzept-Foto und speichert es unter uploads/concepts/.
+    """Generiert ein Konzept-Foto und speichert es versioniert unter uploads/concepts/.
 
-    Rückgabe: relativer API-Pfad `/api/v1/cad/concept-image/{session_id}` oder None.
+    Rückgabe: relativer API-Pfad `/api/v1/cad/concept-image/{session_id}` (zeigt auf
+    das neueste Foto der Session) oder None.
     """
     api_key = settings_store.resolve_openai_api_key()
     if not api_key:
         return None
 
-    safe_id = _SAFE_SESSION.sub("_", session_id)[:64] or "session"
-    concepts_dir = Path(settings.uploads_dir) / "concepts"
-    concepts_dir.mkdir(parents=True, exist_ok=True)
-    dest = concepts_dir / f"{safe_id}.png"
+    safe_id = _safe_session_id(session_id)
+    concepts_dir = _concepts_dir()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+    versioned = concepts_dir / f"{safe_id}_{stamp}.png"
+    latest = concepts_dir / f"{safe_id}.png"
 
     prompt = _build_image_prompt(project_title, user_prompt, parts)
 
@@ -77,7 +94,6 @@ def generate_concept_image(
         from openai import OpenAI
 
         client = OpenAI(api_key=api_key)
-        # gpt-image-1 bevorzugt; Fallback auf dall-e-3 falls das Modell nicht verfügbar ist.
         try:
             response = client.images.generate(
                 model="gpt-image-1",
@@ -98,15 +114,21 @@ def generate_concept_image(
         data = response.data[0]
         b64 = getattr(data, "b64_json", None)
         if b64:
-            dest.write_bytes(base64.b64decode(b64))
+            versioned.write_bytes(base64.b64decode(b64))
         elif getattr(data, "url", None):
             import urllib.request
 
             with urllib.request.urlopen(data.url, timeout=60) as resp:  # noqa: S310 - OpenAI CDN URL
-                dest.write_bytes(resp.read())
+                versioned.write_bytes(resp.read())
         else:
             logger.warning("OpenAI Images lieferte weder b64_json noch url")
             return None
+
+        # Latest-Pointer für bestehende API-Clients; Version bleibt zusätzlich erhalten
+        try:
+            shutil.copy2(versioned, latest)
+        except OSError:
+            latest.write_bytes(versioned.read_bytes())
 
         return f"/api/v1/cad/concept-image/{safe_id}"
     except Exception as exc:  # noqa: BLE001 - Bildgenerierung darf den Graph nicht stoppen
@@ -115,6 +137,22 @@ def generate_concept_image(
 
 
 def concept_image_path(session_id: str) -> Path | None:
-    safe_id = _SAFE_SESSION.sub("_", session_id)[:64] or "session"
-    path = Path(settings.uploads_dir) / "concepts" / f"{safe_id}.png"
-    return path if path.is_file() else None
+    """Neuester Konzept-Pfad der Session (Latest-Pointer)."""
+    safe_id = _safe_session_id(session_id)
+    path = _concepts_dir() / f"{safe_id}.png"
+    if path.is_file():
+        return path
+    # Fallback: neueste versionierte Datei
+    versions = sorted(_concepts_dir().glob(f"{safe_id}_*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return versions[0] if versions else None
+
+
+def list_concept_image_versions(session_id: str) -> list[Path]:
+    """Alle Konzept-Versionen einer Session (älteste zuerst)."""
+    safe_id = _safe_session_id(session_id)
+    versions = sorted(_concepts_dir().glob(f"{safe_id}_*.png"), key=lambda p: p.name)
+    latest = _concepts_dir() / f"{safe_id}.png"
+    if latest.is_file() and latest not in versions:
+        # nur anhängen wenn Inhalt nicht schon als Version existiert
+        versions.append(latest)
+    return versions

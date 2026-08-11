@@ -1,11 +1,4 @@
-"""Master / Supervisor Agent – Orchestrator, Router, Mehrteil-Fortschritt &amp;
-Eskalations-Wächter (SPEC Kap. 3.2.1, 3.4, 3.5).
-
-Nutzer-Feedback: eine Anfrage kann mehrere unabhängige Teile umfassen
-(`requirements_contract.parts`). Der Supervisor erkennt den Abschluss eines
-Teils (`sandbox_result.status == "SUCCESS"`), sichert das Ergebnis in
-`completed_parts`, setzt die Scratch-Felder zurück und rückt zum nächsten
-Teil vor, bevor die reguläre Iterations-/Eskalations-Prüfung greift."""
+"""Master / Supervisor Agent – Orchestrator inkl. V&V-/Flexible-/Fertigungspfad."""
 
 import logging
 
@@ -15,11 +8,11 @@ from app.services.agent_workflow_store import get_max_iterations
 
 logger = logging.getLogger(__name__)
 
+_USER_ESCALATION_REASONS = frozenset({"concept_approval", "requirements_approval"})
+
 
 def _advance_to_next_part(state: AgentState) -> AgentState | None:
-    """Schließt das aktuelle Teil ab (falls erfolgreich validiert) und rückt
-    zum nächsten Teil der Teile-Liste vor. Gibt `None` zurück, falls es
-    nichts zum Abschließen gibt (reguläre Iteration)."""
+    """Schließt das aktuelle Teil ab und rückt zum nächsten vor."""
     sandbox_result = state.get("sandbox_result")
     if not sandbox_result or sandbox_result.get("status") != "SUCCESS":
         return None
@@ -37,13 +30,16 @@ def _advance_to_next_part(state: AgentState) -> AgentState | None:
                 "stock_and_tool_context": state.get("stock_and_tool_context"),
                 "generated_code": state.get("generated_code"),
                 "sandbox_result": sandbox_result,
+                "manufacturing_plan": state.get("manufacturing_plan"),
             }
         )
 
     logger.info("Supervisor: Teil %s/%s abgeschlossen.", idx + 1, len(parts))
     next_idx = idx + 1
     next_hint = (
-        f"Nächstes Teil: {parts[next_idx].get('name')}" if next_idx < len(parts) else "Alle Teile fertig → END"
+        f"Nächstes Teil: {parts[next_idx].get('name')}"
+        if next_idx < len(parts)
+        else "Alle Teile fertig → Montage-Prüfung"
     )
 
     return {
@@ -52,6 +48,9 @@ def _advance_to_next_part(state: AgentState) -> AgentState | None:
         "stock_and_tool_context": None,
         "generated_code": None,
         "sandbox_result": None,
+        "manufacturing_plan": None,
+        "manufacturing_assessed": False,
+        "manufacturing_feasibility": None,
         "error_history": [],
         "iteration_count": 0,
         "current_agent": "supervisor",
@@ -72,16 +71,100 @@ def _advance_to_next_part(state: AgentState) -> AgentState | None:
                     "export_paths": sandbox_result.get("export_paths"),
                     "remaining_parts": max(len(parts) - next_idx, 0),
                 },
-                to_agent="inventory_manager" if next_idx < len(parts) else "END",
+                to_agent="inventory_manager" if next_idx < len(parts) else "montage_manager",
             )
         ],
     }
 
 
+def _compute_next_route(state: AgentState) -> str:
+    """Gemeinsame Routing-Logik für Node-Preview und Conditional Edges."""
+    reason = state.get("escalation_reason")
+    if state.get("human_approval_required") and reason in _USER_ESCALATION_REASONS:
+        return "human_escalation"
+
+    refinement = state.get("refinement_request")
+    if refinement:
+        target = refinement.get("target") or "concept_builder"
+        # Unbekannte Targets auf bekannte Nodes mappen
+        allowed = {
+            "flexible_specialist",
+            "vv_manager",
+            "concept_builder",
+            "inventory_manager",
+            "fertigung_specialist",
+            "montage_manager",
+            "builder_3d",
+            "validator",
+            "human_escalation",
+        }
+        return target if target in allowed else "concept_builder"
+
+    # Requirements-Abstimmung vor weiterem Routing (sonst Loop auf vv_manager)
+    if state.get("vv_needs_alignment") or (
+        state.get("human_approval_required") and reason == "requirements_approval"
+    ):
+        return "human_escalation"
+
+    # 1) Flexible Specialist früh beraten lassen
+    if not state.get("flexible_consulted"):
+        return "flexible_specialist"
+
+    # 2) V&V high-level Requirements (Konzeptphase)
+    consulted = list(state.get("vv_consulted_phases") or [])
+    if "concept" not in consulted:
+        return "vv_manager"
+
+    # 3) Konzept
+    if not state.get("requirements_contract"):
+        return "concept_builder"
+
+    if not state.get("concept_approved"):
+        if reason == "concept_approval":
+            return "human_escalation"
+        return "concept_builder"
+
+    # 4) Nach Konzept-Freigabe: V&V auf Design-Detail
+    if "design" not in consulted:
+        return "vv_manager"
+
+    parts = (state.get("requirements_contract") or {}).get("parts", [])
+    if parts and state.get("current_part_index", 0) >= len(parts):
+        # Abschluss: Fertigungs-V&V → Montage-Prüfung → END
+        if "manufacturing" not in consulted:
+            return "vv_manager"
+        if not state.get("montage_assessed"):
+            return "montage_manager"
+        return "END"
+
+    # 5) Inventory Specialist
+    if not state.get("stock_and_tool_context"):
+        return "inventory_manager"
+
+    # 6) Fertigungs Specialist
+    if not state.get("manufacturing_assessed"):
+        return "fertigung_specialist"
+
+    # 7) Nach Fertigungsplan: V&V manufacturing-Detail
+    if "manufacturing" not in consulted:
+        return "vv_manager"
+
+    # 8) 3D + Validator
+    if not state.get("generated_code"):
+        return "builder_3d"
+
+    sandbox_result = state.get("sandbox_result")
+    if not sandbox_result:
+        return "validator"
+
+    if sandbox_result.get("status") != "SUCCESS":
+        return "builder_3d"
+
+    return "inventory_manager"
+
+
 def supervisor_node(state: AgentState) -> AgentState:
-    """Zählt Iterationen, rückt bei Erfolg zum nächsten Teil vor.
-    Überschrittenes Iterationslimit führt nicht mehr zur User-Eskalation –
-    die Pipeline arbeitet weiter (nur Warnung im Transcript)."""
+    """Zählt Iterationen, rückt bei Erfolg zum nächsten Teil vor, routet Pipeline."""
 
     advance_update = _advance_to_next_part(state)
     if advance_update is not None:
@@ -91,32 +174,7 @@ def supervisor_node(state: AgentState) -> AgentState:
     parts = (state.get("requirements_contract") or {}).get("parts", [])
     idx = state.get("current_part_index", 0)
     part_name = parts[idx].get("name") if 0 <= idx < len(parts) else None
-
-    # Vorausschau der Route (gleiche Logik wie route_from_supervisor) fürs Log.
-    if state.get("human_approval_required") and state.get("escalation_reason") == "concept_approval":
-        next_route = "human_escalation"
-    elif not state.get("requirements_contract"):
-        next_route = "concept_builder"
-    elif state.get("refinement_request"):
-        next_route = (state.get("refinement_request") or {}).get("target", "concept_builder")
-    elif not state.get("concept_approved"):
-        next_route = (
-            "human_escalation"
-            if state.get("escalation_reason") == "concept_approval"
-            else "concept_builder"
-        )
-    elif idx >= len(parts) and parts:
-        next_route = "END"
-    elif not state.get("stock_and_tool_context"):
-        next_route = "inventory_manager"
-    elif not state.get("generated_code"):
-        next_route = "builder_3d"
-    elif not state.get("sandbox_result"):
-        next_route = "validator"
-    elif (state.get("sandbox_result") or {}).get("status") != "SUCCESS":
-        next_route = "builder_3d"
-    else:
-        next_route = "inventory_manager"
+    next_route = _compute_next_route(state)
 
     summary = (
         f"Iteration {iteration_count}"
@@ -140,8 +198,12 @@ def supervisor_node(state: AgentState) -> AgentState:
                     "total_parts": len(parts),
                     "part_name": part_name,
                     "concept_approved": bool(state.get("concept_approved")),
+                    "vv_phase": state.get("vv_phase"),
+                    "flexible_consulted": bool(state.get("flexible_consulted")),
                     "has_contract": bool(state.get("requirements_contract")),
                     "has_stock_context": bool(state.get("stock_and_tool_context")),
+                    "manufacturing_assessed": bool(state.get("manufacturing_assessed")),
+                    "montage_assessed": bool(state.get("montage_assessed")),
                     "has_code": bool(state.get("generated_code")),
                     "has_sandbox": bool(state.get("sandbox_result")),
                     "refinement": state.get("refinement_request"),
@@ -154,7 +216,6 @@ def supervisor_node(state: AgentState) -> AgentState:
     }
 
     if not state.get("human_approval_required") and iteration_count > get_max_iterations():
-        # Keine User-Eskalation mehr: Agenten arbeiten weiter (Warnung nur im Log).
         logger.warning(
             "Supervisor: Iterationslimit (%s) überschritten – fahre ohne User-Pause fort (Iteration %s)",
             get_max_iterations(),
@@ -173,12 +234,11 @@ def supervisor_node(state: AgentState) -> AgentState:
             )
         ]
 
-    # Veraltete Generic-Eskalations-Flags verwerfen (nur Konzept-Freigabe bleibt)
-    if state.get("human_approval_required") and state.get("escalation_reason") != "concept_approval":
+    # Veraltete Generic-Eskalations-Flags verwerfen (Konzept + Requirements bleiben)
+    if state.get("human_approval_required") and state.get("escalation_reason") not in _USER_ESCALATION_REASONS:
         updates["human_approval_required"] = False
         updates["escalation_reason"] = None
 
-    # Fehlgeschlagene Sandbox → Code/Result löschen, damit Builder neu generiert
     sandbox = state.get("sandbox_result")
     if sandbox and sandbox.get("status") != "SUCCESS" and next_route == "builder_3d":
         updates["sandbox_result"] = None
@@ -194,44 +254,4 @@ def supervisor_node(state: AgentState) -> AgentState:
 
 
 def route_from_supervisor(state: AgentState) -> str:
-    """Zentrale Routing-Logik. User-Interrupt nur noch für Konzept-Freigabe;
-    alle anderen Engpässe werden intern weitergeschleift."""
-
-    # Nur echte Konzept-Freigabe pausiert für den Nutzer
-    if state.get("human_approval_required") and state.get("escalation_reason") == "concept_approval":
-        return "human_escalation"
-
-    if not state.get("requirements_contract"):
-        return "concept_builder"
-
-    refinement = state.get("refinement_request")
-    if refinement:
-        return refinement.get("target", "concept_builder")
-
-    if not state.get("concept_approved"):
-        # Noch kein Freigabe-Flag: zurück zum Concept Builder (setzt Freigabe-Gate)
-        if state.get("escalation_reason") == "concept_approval":
-            return "human_escalation"
-        return "concept_builder"
-
-    parts = (state.get("requirements_contract") or {}).get("parts", [])
-    if state.get("current_part_index", 0) >= len(parts):
-        return "END"
-
-    if not state.get("stock_and_tool_context"):
-        return "inventory_manager"
-
-    if not state.get("generated_code"):
-        return "builder_3d"
-
-    sandbox_result = state.get("sandbox_result")
-    if not sandbox_result:
-        return "validator"
-
-    # Stuck-State (z.B. fehlgeschlagene Sandbox ohne Refinement): neu versuchen
-    if sandbox_result.get("status") != "SUCCESS":
-        return "builder_3d"
-
-    # SUCCESS hätte von _advance_to_next_part verarbeitet werden sollen –
-    # Sicherheitsnetz: zum nächsten Schritt / Inventory
-    return "inventory_manager"
+    return _compute_next_route(state)

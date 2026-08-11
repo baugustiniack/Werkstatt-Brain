@@ -47,7 +47,17 @@ function App() {
 
   const persistedParts = useMemo(() => partsFromArtifacts(conversationArtifacts), [conversationArtifacts]);
 
-  const parts = liveParts.length > 0 ? liveParts : persistedParts;
+  // Live und persistierte Artefakte zusammenführen – Pause/Standby darf nichts löschen
+  const parts = useMemo(() => {
+    if (liveParts.length === 0) return persistedParts;
+    if (persistedParts.length === 0) return liveParts;
+    const max = Math.max(liveParts.length, persistedParts.length);
+    const merged: ModelViewerPart[] = [];
+    for (let i = 0; i < max; i++) {
+      merged.push(liveParts[i] ?? persistedParts[i]);
+    }
+    return merged;
+  }, [liveParts, persistedParts]);
   const hasAnyPart = parts.length > 0;
   const singleStlUrl = hasAnyPart ? parts[Math.min(selectedPartIndex, parts.length - 1)].stlUrl : null;
 
@@ -62,6 +72,7 @@ function App() {
     setSelectedPartIndex(Math.max(parts.length - 1, 0));
   }, [parts.length]);
 
+  // Konzept-Freigabe läuft inline im Chat; Requirements & sonstige Gates als Dialog
   const showGenericEscalation =
     cad.escalation && cad.escalation.reason !== "concept_approval" ? cad.escalation : null;
 

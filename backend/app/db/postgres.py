@@ -31,3 +31,12 @@ def verify_postgres_connection() -> None:
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    # Additive Schema-Updates ohne Alembic (bestehende DBs)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "ALTER TABLE conversation_artifacts "
+                "ADD COLUMN IF NOT EXISTS meta JSONB"
+            )
+        )
+    logger.info("PostgreSQL schema bereit (create_all + additive Alters)")

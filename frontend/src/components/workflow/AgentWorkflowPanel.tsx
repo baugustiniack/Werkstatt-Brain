@@ -11,10 +11,14 @@ import {
 
 const AGENT_ORDER = [
   "supervisor",
+  "flexible_specialist",
+  "vv_manager",
   "concept_builder",
   "inventory_manager",
+  "fertigung_specialist",
   "builder_3d",
   "validator",
+  "montage_manager",
   "human_escalation",
 ] as const;
 
@@ -49,10 +53,14 @@ function WorkflowDiagram({ edges }: { edges: WorkflowEdge[] }) {
   const mainFlow = [
     "START",
     "supervisor",
+    "flexible_specialist",
+    "vv_manager",
     "concept_builder",
     "inventory_manager",
+    "fertigung_specialist",
     "builder_3d",
     "validator",
+    "montage_manager",
     "END",
   ];
   const loopEdges = edges.filter((e) => e.loop);

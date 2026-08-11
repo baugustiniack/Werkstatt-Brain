@@ -55,6 +55,7 @@ class AgentState(TypedDict, total=False):
 
     # --- Erweiterungen für Routing, Eskalation & Meta-Coach-Logging ---
     session_id: str
+    conversation_id: str | None
     refinement_request: RefinementRequest | None
     escalation_reason: str | None
     error_history: list[str]
@@ -65,6 +66,32 @@ class AgentState(TypedDict, total=False):
     concept_approved: bool
     current_part_index: int
     completed_parts: list[dict[str, Any]]
+
+    # --- V&V / Flexible / Fertigung ---
+    # vv_requirements: phasenweise Requirements (concept → design → manufacturing)
+    vv_requirements: dict[str, Any]
+    vv_phase: str  # concept | design | manufacturing
+    vv_approved: bool
+    vv_needs_alignment: bool
+    # Antworten aus dem V&V-Fragen-Interview (Frage → Antwort)
+    vv_qa_answers: list[dict[str, Any]]
+    # Vom Supervisor zugeschnittenes Expertenprofil + Beratung
+    flexible_specialist_profile: dict[str, Any]
+    advisory_notes: str
+    flexible_advice: dict[str, Any]
+    # Fertigungsbewertung + Schritt-für-Schritt-Ablauf
+    manufacturing_plan: dict[str, Any]
+    manufacturing_feasibility: dict[str, Any]
+    # Flags: Flexible/V&V/Fertigung bereits in dieser Phase gelaufen
+    flexible_consulted: bool
+    vv_consulted_phases: list[str]
+    manufacturing_assessed: bool
+
+    # --- Montage ---
+    montage_result: dict[str, Any]
+    assembly_plan: dict[str, Any]
+    assembly_manual: dict[str, Any]
+    montage_assessed: bool
 
     # --- Analyse-Log: Unterhaltungsverläufe der Sub-Agenten ---
     agent_transcript: Annotated[list[dict[str, Any]], append_transcript]

@@ -45,8 +45,14 @@ export interface UseCadStreamResult {
   currentPartName: string | null;
   /** Startet einen Workflow-Turn; löscht nicht den Chat-Verlauf (nur Run-State). */
   start: (prompt: string, conversationId?: string | null) => Promise<string | null>;
+  /** Setzt eine pausierte Session lückenlos fort (kein neues Konzept). */
+  resume: (sessionId: string, conversationId?: string | null) => Promise<string | null>;
+  /** Startet Ausarbeitung ab einem gespeicherten Konzept-Foto im Chat. */
+  elaborateConcept: (conversationId: string, artifactId: string) => Promise<string | null>;
   resolveEscalation: (decision: ConceptDecision | unknown) => void;
   cancel: () => Promise<void>;
+  /** Session-ID der zuletzt pausierten Session (für Fortsetzen). */
+  pausedSessionId: string | null;
   /** Setzt nur den laufenden CAD-Run zurück (nicht die Unterhaltung). */
   clearRun: () => void;
 }
@@ -58,6 +64,7 @@ export interface UseCadStreamResult {
 export function useCadStream(): UseCadStreamResult {
   const [status, setStatus] = useState<CadRunStatus>("idle");
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [pausedSessionId, setPausedSessionId] = useState<string | null>(null);
   const [currentNode, setCurrentNode] = useState<AgentNodeName | null>(null);
   const [logs, setLogs] = useState<AgentLogEntry[]>([]);
   const [escalation, setEscalation] = useState<EscalationPayload | null>(null);
@@ -67,13 +74,17 @@ export function useCadStream(): UseCadStreamResult {
 
   const socketRef = useRef<WebSocket | null>(null);
   const sessionIdRef = useRef<string | null>(null);
+  const pausedSessionIdRef = useRef<string | null>(null);
 
   const clearRun = useCallback(() => {
-    socketRef.current?.close();
+    const prevSocket = socketRef.current;
     socketRef.current = null;
+    prevSocket?.close();
     sessionIdRef.current = null;
+    pausedSessionIdRef.current = null;
     setStatus("idle");
     setSessionId(null);
+    setPausedSessionId(null);
     setCurrentNode(null);
     setLogs([]);
     setEscalation(null);
@@ -101,6 +112,14 @@ export function useCadStream(): UseCadStreamResult {
                 ...message.state.agent_transcript,
               ];
             }
+            // completed_parts nie durch leere Updates verlieren
+            if (
+              !Array.isArray(message.state.completed_parts) &&
+              Array.isArray(prev.completed_parts) &&
+              (prev.completed_parts as unknown[]).length > 0
+            ) {
+              next.completed_parts = prev.completed_parts;
+            }
             return next;
           });
           break;
@@ -116,6 +135,10 @@ export function useCadStream(): UseCadStreamResult {
         case "cancelled":
           setStatus("cancelled");
           setEscalation(null);
+          if (sessionIdRef.current) {
+            setPausedSessionId(sessionIdRef.current);
+            pausedSessionIdRef.current = sessionIdRef.current;
+          }
           break;
         case "error":
           setStatus("error");
@@ -130,21 +153,38 @@ export function useCadStream(): UseCadStreamResult {
     };
 
     socket.onclose = () => {
+      // Nur unerwartete Trennung (Standby) → Pause; bewusstes close() nullt socketRef vorher
+      if (socketRef.current !== socket) {
+        return;
+      }
       socketRef.current = null;
+      setStatus((prev) => {
+        if (prev === "running" || prev === "connecting" || prev === "escalation") {
+          if (sessionIdRef.current) {
+            setPausedSessionId(sessionIdRef.current);
+            pausedSessionIdRef.current = sessionIdRef.current;
+          }
+          return "cancelled";
+        }
+        return prev;
+      });
     };
   }, []);
 
   const start = useCallback(
     async (prompt: string, conversationId?: string | null) => {
       // Nur Run-State zurücksetzen – Chat bleibt in der Conversation-API.
-      socketRef.current?.close();
+      const prevSocket = socketRef.current;
       socketRef.current = null;
+      prevSocket?.close();
       setLogs([]);
       setEscalation(null);
       setResult(null);
       setErrorMessage(null);
       setLatestState({});
       setCurrentNode(null);
+      setPausedSessionId(null);
+      pausedSessionIdRef.current = null;
       setStatus("connecting");
       try {
         const pending = await api.post<{ session_id: string; status: string }>("/api/v1/cad/generate", {
@@ -165,6 +205,91 @@ export function useCadStream(): UseCadStreamResult {
     [openStream],
   );
 
+  const resume = useCallback(
+    async (pausedId: string, conversationId?: string | null) => {
+      const prevSocket = socketRef.current;
+      socketRef.current = null;
+      prevSocket?.close();
+      setLogs([]);
+      setEscalation(null);
+      setResult(null);
+      setErrorMessage(null);
+      setCurrentNode(null);
+      setStatus("connecting");
+      try {
+        const pending = await api.post<{
+          session_id: string;
+          resumed_from: string;
+          status: string;
+          completed_parts?: CompletedPart[] | null;
+          current_part_index?: number;
+          concept_image_url?: string | null;
+          requirements_contract?: RequirementsContract | null;
+        }>("/api/v1/cad/resume-run", {
+          session_id: pausedId,
+          conversation_id: conversationId || undefined,
+        });
+        sessionIdRef.current = pending.session_id;
+        setSessionId(pending.session_id);
+        setPausedSessionId(null);
+        pausedSessionIdRef.current = null;
+        // Fertige Teile sofort wieder in den Viewer laden
+        setLatestState((prev) => ({
+          ...prev,
+          completed_parts: pending.completed_parts ?? prev.completed_parts ?? [],
+          current_part_index: pending.current_part_index ?? prev.current_part_index ?? 0,
+          concept_image_url: pending.concept_image_url ?? prev.concept_image_url,
+          requirements_contract: pending.requirements_contract ?? prev.requirements_contract,
+        }));
+        setStatus("running");
+        openStream(pending.session_id);
+        return pending.session_id;
+      } catch (err) {
+        setStatus("cancelled");
+        setPausedSessionId(pausedId);
+        pausedSessionIdRef.current = pausedId;
+        setErrorMessage(err instanceof Error ? err.message : "Fortsetzen fehlgeschlagen.");
+        return null;
+      }
+    },
+    [openStream],
+  );
+
+  const elaborateConcept = useCallback(
+    async (conversationId: string, artifactId: string) => {
+      const prevSocket = socketRef.current;
+      socketRef.current = null;
+      prevSocket?.close();
+      setLogs([]);
+      setEscalation(null);
+      setResult(null);
+      setErrorMessage(null);
+      setCurrentNode(null);
+      setStatus("connecting");
+      try {
+        const pending = await api.post<{ session_id: string; status: string }>(
+          "/api/v1/cad/elaborate-concept",
+          {
+            conversation_id: conversationId,
+            artifact_id: artifactId,
+          },
+        );
+        sessionIdRef.current = pending.session_id;
+        setSessionId(pending.session_id);
+        setPausedSessionId(null);
+        pausedSessionIdRef.current = null;
+        setStatus("running");
+        openStream(pending.session_id);
+        return pending.session_id;
+      } catch (err) {
+        setStatus("error");
+        setErrorMessage(err instanceof Error ? err.message : "Ausarbeitung fehlgeschlagen.");
+        return null;
+      }
+    },
+    [openStream],
+  );
+
   const resolveEscalation = useCallback((decision: ConceptDecision | unknown) => {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
@@ -178,17 +303,21 @@ export function useCadStream(): UseCadStreamResult {
 
   const cancel = useCallback(async () => {
     const sid = sessionIdRef.current ?? sessionId;
-    setStatus("cancelled");
-    setEscalation(null);
-    socketRef.current?.close();
-    socketRef.current = null;
     if (sid) {
+      setPausedSessionId(sid);
+      pausedSessionIdRef.current = sid;
       try {
+        // Zuerst Backend-Snapshot, dann WS schließen (sonst geht der Pause-State verloren)
         await api.post(`/api/v1/cad/cancel/${sid}`, {});
       } catch {
-        // UI ist bereits cancelled
+        // UI ist bereits pausiert
       }
     }
+    setStatus("cancelled");
+    setEscalation(null);
+    const prevSocket = socketRef.current;
+    socketRef.current = null;
+    prevSocket?.close();
   }, [sessionId]);
 
   const effectiveState = (result as unknown as Record<string, unknown>) ?? latestState;
@@ -234,8 +363,11 @@ export function useCadStream(): UseCadStreamResult {
     totalParts,
     currentPartName,
     start,
+    resume,
+    elaborateConcept,
     resolveEscalation,
     cancel,
+    pausedSessionId,
     clearRun,
   };
 }

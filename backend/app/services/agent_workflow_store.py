@@ -27,13 +27,23 @@ DEFAULT_EDGES: list[dict[str, Any]] = [
     {"from": "START", "to": "supervisor", "when": "jeder Lauf beginnt hier"},
     {
         "from": "supervisor",
-        "to": "concept_builder",
-        "when": "kein requirements_contract vorhanden",
+        "to": "flexible_specialist",
+        "when": "noch nicht flexible_consulted – anfragespezifisches Expertenprofil",
+    },
+    {
+        "from": "supervisor",
+        "to": "vv_manager",
+        "when": "V&V-Phase concept/design/manufacturing noch nicht in vv_consulted_phases",
     },
     {
         "from": "supervisor",
         "to": "human_escalation",
-        "when": "Konzept-Freigabe nötig, max. Iterationen oder Eskalationsflag",
+        "when": "requirements_approval oder concept_approval",
+    },
+    {
+        "from": "supervisor",
+        "to": "concept_builder",
+        "when": "kein requirements_contract bzw. Konzept noch nicht freigegeben",
     },
     {
         "from": "supervisor",
@@ -42,8 +52,13 @@ DEFAULT_EDGES: list[dict[str, Any]] = [
     },
     {
         "from": "supervisor",
+        "to": "fertigung_specialist",
+        "when": "Inventar da, Fertigung noch nicht bewertet (manufacturing_assessed)",
+    },
+    {
+        "from": "supervisor",
         "to": "builder_3d",
-        "when": "Inventar-Kontext da, noch kein generated_code",
+        "when": "Fertigungsplan/V&V-manufacturing da, noch kein generated_code",
     },
     {
         "from": "supervisor",
@@ -52,8 +67,23 @@ DEFAULT_EDGES: list[dict[str, Any]] = [
     },
     {
         "from": "supervisor",
+        "to": "montage_manager",
+        "when": "alle parts in completed_parts, V&V manufacturing abgestimmt, noch nicht montage_assessed",
+    },
+    {
+        "from": "supervisor",
         "to": "END",
-        "when": "alle parts in completed_parts",
+        "when": "alle parts fertig und Montage-Prüfung abgeschlossen (montage_assessed)",
+    },
+    {
+        "from": "flexible_specialist",
+        "to": "supervisor",
+        "when": "Profil + Advisory-Notes gesetzt",
+    },
+    {
+        "from": "vv_manager",
+        "to": "supervisor",
+        "when": "Requirements aktualisiert (ggf. Alignment-Flag)",
     },
     {
         "from": "concept_builder",
@@ -64,6 +94,16 @@ DEFAULT_EDGES: list[dict[str, Any]] = [
         "from": "inventory_manager",
         "to": "supervisor",
         "when": "CONTEXT_INJECTION fertig",
+    },
+    {
+        "from": "fertigung_specialist",
+        "to": "supervisor",
+        "when": "Machbarkeit + Arbeitsschritte dokumentiert",
+    },
+    {
+        "from": "montage_manager",
+        "to": "supervisor",
+        "when": "Passung/Montierbarkeit geprüft, assembly_plan gesetzt",
     },
     {"from": "builder_3d", "to": "supervisor", "when": "build123d-Code erzeugt"},
     {
@@ -93,10 +133,10 @@ DEFAULT_EDGES: list[dict[str, Any]] = [
 DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
     "supervisor": {
         "display_name": "Supervisor",
-        "role": "Zentraler Orchestrator und Router der LangGraph-Topologie.",
+        "role": "Zentraler Orchestrator und Router; stellt das Flexible-Specialist-Profil zu.",
         "responsibilities": [
             "Entscheidet den nächsten Sub-Agenten anhand des States",
-            "Zählt Korrekturschleifen und erzwingt Eskalation bei Limit",
+            "Orchestriert Flexible → V&V → Concept → Design-V&V → Inventory → Fertigung → Manufacturing-V&V → 3D → Montage",
             "Sichert fertige Teile in completed_parts und rückt zum nächsten Teil vor",
         ],
         "inputs": ["gesamter AgentState"],
@@ -106,15 +146,52 @@ DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
             "notes": "Routing ist codegesteuert; guidance dient der Meta-Coach-Dokumentation.",
         },
     },
+    "flexible_specialist": {
+        "display_name": "Flexible Specialist",
+        "role": "Anfragespezifischer Experte – Profil vom Supervisor zugeschnitten, berät von Anfang an.",
+        "responsibilities": [
+            "Erstellt ein auf die User-Anfrage zugeschnittenes Expertenprofil",
+            "Berät V&V, Concept Builder, Inventory und Fertigung",
+            "Schreibt advisory_notes und konkrete Vorschläge in den State",
+        ],
+        "inputs": ["user_prompt", "Supervisor-Guidance"],
+        "outputs": ["flexible_specialist_profile", "advisory_notes", "flexible_advice"],
+        "properties": {
+            "guidance": "",
+            "notes": "Immer früh im Lauf; Profil bleibt für die Session bestehen.",
+        },
+    },
+    "vv_manager": {
+        "display_name": "V&V Manager",
+        "role": "Verification & Validation – Requirements aus dem Prompt, phasenweise vertieft.",
+        "responsibilities": [
+            "High-Level-Requirements in der Konzeptphase",
+            "Vertiefung in Design-, 3D- und Fertigungsphase",
+            "Abstimmung mit dem Nutzer bei kritischen offenen Fragen",
+            "Nutzt Input von Concept, Fertigung, Inventory und Flexible Specialist",
+        ],
+        "inputs": [
+            "user_prompt",
+            "advisory_notes",
+            "requirements_contract",
+            "manufacturing_plan",
+            "flexible_specialist_profile",
+        ],
+        "outputs": ["vv_requirements", "vv_phase", "vv_needs_alignment", "vv_consulted_phases"],
+        "properties": {
+            "guidance": "",
+            "notes": "needs_user_alignment nur bei echten open_questions → requirements_approval.",
+        },
+    },
     "concept_builder": {
         "display_name": "Concept Builder",
         "role": "Zerlegt Nutzerwünsche in CNC-fertigbare Teile und erzeugt den Requirements-Contract.",
         "responsibilities": [
-            "Mehrteil-Dekomposition (LLM oder Heuristik)",
+            "Mehrteil-Dekomposition (LLM oder Heuristik) unter Beachtung der V&V-Requirements",
             "2D-Sketch / Konzeptfoto für Human-Approval",
             "gap_analysis und Annahmen dokumentieren",
         ],
-        "inputs": ["user_prompt", "refinement_request (Feedback)"],
+        "inputs": ["user_prompt", "vv_requirements", "advisory_notes", "refinement_request"],
         "outputs": ["requirements_contract", "concept_sketch_svg", "concept_image_url"],
         "properties": {
             "guidance": "",
@@ -123,12 +200,12 @@ DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
         },
     },
     "inventory_manager": {
-        "display_name": "Inventory Manager",
+        "display_name": "Inventory Specialist",
         "role": "Passt Contract an verfügbares Material/Werkzeug an und injiziert Kontext.",
         "responsibilities": [
             "Stock- und Tool-Matching",
             "Lessons-Learned-Regeln laden",
-            "CONTEXT_INJECTION für den 3D Builder",
+            "CONTEXT_INJECTION für Fertigung und 3D Builder",
         ],
         "inputs": ["requirements_contract", "Inventar-DB", "Asset-Beschreibungen (notes)", "rules/*.json"],
         "outputs": ["stock_and_tool_context", "ggf. angepasster Contract"],
@@ -136,6 +213,58 @@ DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
             "guidance": "",
             "strict_tool_match": False,
             "notes": "",
+        },
+    },
+    "fertigung_specialist": {
+        "display_name": "Fertigungs Specialist",
+        "role": "Experte für alle Maschinen in der Inventar-DB; Machbarkeit und Arbeitsabläufe.",
+        "responsibilities": [
+            "Bewertet Design-Konzepte auf Realisierbarkeit in der Werkstatt",
+            "Wählt benötigte Maschinen aus dem Inventar",
+            "Erstellt Schritt-für-Schritt-Arbeitsabläufe",
+        ],
+        "inputs": [
+            "requirements_contract",
+            "stock_and_tool_context",
+            "vv_requirements",
+            "advisory_notes",
+            "Maschinen/Assets aus Inventar-DB",
+        ],
+        "outputs": ["manufacturing_plan", "manufacturing_feasibility", "manufacturing_assessed"],
+        "properties": {
+            "guidance": "",
+            "notes": "Nutzt Tool-Tabelle und maschinenbezogene Assets aus der Inventar-DB.",
+        },
+    },
+    "montage_manager": {
+        "display_name": "Montage Manager",
+        "role": "Prüft Passung/Montierbarkeit und schreibt die Montage-Anleitung inkl. Werkzeugwahl.",
+        "responsibilities": [
+            "Vergleicht Maße und Anschlussflächen der completed_parts",
+            "Bewertet Passung und Montierbarkeit (assemblable)",
+            "Schreibt eine praxisnahe Montage-Anleitung (Schritte, Sicherheit, Checkliste)",
+            "Nutzt vorhandene Werkzeuge aus der Inventar-DB; empfiehlt fehlende Neuanschaffungen",
+        ],
+        "inputs": [
+            "completed_parts",
+            "requirements_contract",
+            "manufacturing_plan",
+            "vv_requirements",
+            "advisory_notes",
+            "Tools/Assets aus Inventar-DB",
+        ],
+        "outputs": [
+            "montage_result",
+            "assembly_plan",
+            "assembly_manual",
+            "montage_assessed",
+        ],
+        "properties": {
+            "guidance": "",
+            "notes": (
+                "Läuft nach Abschluss aller Teile und Manufacturing-V&V, vor END. "
+                "assembly_manual enthält Markdown-Anleitung plus tools_from_inventory / tools_recommended."
+            ),
         },
     },
     "builder_3d": {
@@ -169,13 +298,14 @@ DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
     },
     "human_escalation": {
         "display_name": "Human Escalation",
-        "role": "Pausiert den Graphen (interrupt) und holt Nutzerentscheidungen ein.",
+        "role": "Pausiert den Graphen (interrupt) für Requirements- und Konzept-Freigabe.",
         "responsibilities": [
-            "Konzept-Freigabe (approve/revise)",
-            "Eskalationen bei fehlgeschlagenen Loops",
+            "Requirements-Abstimmung (requirements_approval)",
+            "Konzept-Freigabe (concept_approval)",
+            "Sonstige Eskalationen ohne User-Pause fortsetzen",
         ],
-        "inputs": ["escalation_reason", "concept_*", "requirements_contract"],
-        "outputs": ["concept_approved", "refinement_request", "User-Decision"],
+        "inputs": ["escalation_reason", "vv_requirements", "concept_*", "requirements_contract"],
+        "outputs": ["vv_approved", "concept_approved", "refinement_request", "User-Decision"],
         "properties": {
             "guidance": "",
             "notes": "",
@@ -187,8 +317,9 @@ DEFAULT_WORKFLOW: dict[str, Any] = {
     "max_iterations": 6,
     "sandbox_timeout_seconds": 20,
     "description": (
-        "Hub-and-Spoke: Alle Fach-Agenten melden an den Supervisor zurück. "
-        "Korrekturschleifen laufen über refinement_request.target."
+        "Hub-and-Spoke mit V&V-Phasen: Flexible Specialist → V&V (concept) → Concept Builder → "
+        "V&V (design) → Inventory Specialist → Fertigungs Specialist → V&V (manufacturing) → "
+        "3D Builder → Validator → Montage Manager. Korrekturschleifen über refinement_request.target."
     ),
     "notes": "",
 }
@@ -231,7 +362,18 @@ def load_agent_profiles() -> dict[str, Any]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         agents = _deep_merge(DEFAULT_AGENTS, raw.get("agents") or {})
-        edges = raw.get("edges") or deepcopy(DEFAULT_EDGES)
+        raw_edges = raw.get("edges")
+        edge_nodes: set[Any] = set()
+        if isinstance(raw_edges, list):
+            for e in raw_edges:
+                if isinstance(e, dict):
+                    edge_nodes.add(e.get("from"))
+                    edge_nodes.add(e.get("to"))
+        # Alte Topologie ohne V&V/Flexible/Fertigung/Montage → Defaults
+        if not raw_edges or "vv_manager" not in edge_nodes or "montage_manager" not in edge_nodes:
+            edges = deepcopy(DEFAULT_EDGES)
+        else:
+            edges = raw_edges
         return {"agents": agents, "edges": edges, "updated_at": raw.get("updated_at")}
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("agent_profiles.json unlesbar: %s", exc)
