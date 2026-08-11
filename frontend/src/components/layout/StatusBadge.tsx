@@ -4,6 +4,8 @@ import type { CadRunStatus } from "../../api/useCadStream";
 const NODE_LABELS: Record<AgentNodeName, string> = {
   supervisor: "SUPERVISOR",
   flexible_specialist: "FLEXIBLE_SPECIALIST",
+  custom_agent_1: "LEER_AGENT_1",
+  custom_agent_2: "LEER_AGENT_2",
   vv_manager: "VV_MANAGER",
   concept_builder: "CONCEPT",
   inventory_manager: "FETCHING_INVENTORY",

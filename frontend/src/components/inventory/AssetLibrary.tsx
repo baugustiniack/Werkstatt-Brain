@@ -4,8 +4,10 @@ import type { InventoryItem } from "../../api/types";
 import {
   useCreateManualEntry,
   useInventoryItems,
+  useKnowledgeGraphStats,
   useProcessInventoryItem,
   useProcessPendingItems,
+  useTrainKnowledgeGraph,
   useUpdateInventoryItem,
 } from "../../hooks/useInventoryItems";
 import { useApiKeyStatus } from "../../hooks/useSettings";
@@ -24,13 +26,22 @@ const SOURCE_LABELS: Record<string, string> = {
   manual: "Manuell",
 };
 
-function descriptionOf(item: InventoryItem): string {
-  if (item.notes?.trim()) return item.notes.trim();
+function userNotesOf(item: InventoryItem): string {
+  return (item.user_notes ?? "").trim();
+}
+
+function aiNotesOf(item: InventoryItem): string {
+  const ai = (item.ai_notes ?? item.notes ?? "").trim();
+  if (ai) return ai;
   const vision = item.vision_result;
   if (vision && typeof vision.description === "string" && vision.description.trim()) {
     return vision.description.trim();
   }
   return "";
+}
+
+function previewDescription(item: InventoryItem): string {
+  return userNotesOf(item) || aiNotesOf(item);
 }
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -75,7 +86,7 @@ function needsAiScan(item: InventoryItem): boolean {
   ) {
     return true;
   }
-  const text = descriptionOf(item).toLowerCase();
+  const text = aiNotesOf(item).toLowerCase();
   return (
     text.includes("kein vision-modell") ||
     text.includes("kein openai") ||
@@ -83,7 +94,7 @@ function needsAiScan(item: InventoryItem): boolean {
     text.includes("automatische heuristik") ||
     text.includes("bitte manuell prüfen") ||
     text.includes("bitte beschreibung manuell ergänzen") ||
-    text.includes("bildanalyse") && text.includes("fehlgeschlagen")
+    (text.includes("bildanalyse") && text.includes("fehlgeschlagen"))
   );
 }
 
@@ -98,26 +109,31 @@ function AssetDetail({
   const process = useProcessInventoryItem();
   const { data: keyStatus } = useApiKeyStatus();
   const [title, setTitle] = useState(item.title ?? "");
-  const [description, setDescription] = useState(descriptionOf(item));
+  const [userNotes, setUserNotes] = useState(userNotesOf(item));
+  const [aiNotes, setAiNotes] = useState(aiNotesOf(item));
   const [showMeta, setShowMeta] = useState(false);
   const fileUrl = item.file_path ? assetFileUrl(item.id) : null;
   const dirty =
-    title.trim() !== (item.title ?? "").trim() || description.trim() !== descriptionOf(item);
+    title.trim() !== (item.title ?? "").trim() ||
+    userNotes.trim() !== userNotesOf(item) ||
+    aiNotes.trim() !== aiNotesOf(item);
   const openaiReady = !!keyStatus?.openai_configured;
   const showImageKeyHint = item.file_type === "image" && !openaiReady;
   const showRescanHint = item.file_type === "image" && openaiReady && needsAiScan(item);
 
   useEffect(() => {
     setTitle(item.title ?? "");
-    setDescription(descriptionOf(item));
+    setUserNotes(userNotesOf(item));
+    setAiNotes(aiNotesOf(item));
     setShowMeta(false);
-  }, [item.id, item.title, item.notes, item.vision_result]);
+  }, [item.id, item.title, item.user_notes, item.ai_notes, item.notes, item.vision_result]);
 
   const handleSave = () => {
     update.mutate({
       id: item.id,
       title: title.trim() || undefined,
-      notes: description,
+      user_notes: userNotes,
+      ai_notes: aiNotes,
     });
   };
 
@@ -173,19 +189,32 @@ function AssetDetail({
         />
       </label>
 
-      <label className="flex min-h-0 flex-1 flex-col gap-1 text-xs">
+      <label className="flex flex-col gap-1 text-xs">
         <span className="text-workshop-muted">
-          KI-/Nutzer-Beschreibung (wird vom Inventory Manager für Konzepte &amp; 3D-Teile gelesen)
+          Deine Beschreibung (wird bei „KI beschreiben“ einbezogen, nie überschrieben)
         </span>
         <textarea
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
+          value={userNotes}
+          onChange={(e) => setUserNotes(e.target.value)}
+          placeholder="Eigene Notizen, Maße, Herkunft, Hinweise…"
+          rows={4}
+          className="resize-y rounded-md border border-workshop-border bg-workshop-bg p-2 leading-relaxed"
+        />
+      </label>
+
+      <label className="flex min-h-0 flex-1 flex-col gap-1 text-xs">
+        <span className="text-workshop-muted">
+          KI-Beschreibung (vom Inventory Manager gelesen; optional nachbearbeitbar)
+        </span>
+        <textarea
+          value={aiNotes}
+          onChange={(e) => setAiNotes(e.target.value)}
           placeholder={
             needsAiScan(item)
               ? "Noch keine echte KI-Beschreibung – „KI beschreiben“ oder Batch-Scan starten."
-              : "Beschreibung eingeben oder von der KI erzeugen lassen…"
+              : "Wird von der KI erzeugt…"
           }
-          className="min-h-[180px] flex-1 resize-y rounded-md border border-workshop-border bg-workshop-bg p-2 leading-relaxed"
+          className="min-h-[140px] flex-1 resize-y rounded-md border border-workshop-border bg-workshop-bg p-2 leading-relaxed"
         />
       </label>
 
@@ -197,7 +226,7 @@ function AssetDetail({
       )}
       {showRescanHint && (
         <p className="text-[11px] text-workshop-muted">
-          Noch Heuristik-Text – mit „KI beschreiben“ per OpenAI neu scannen.
+          Noch Heuristik-Text – mit „KI beschreiben“ per OpenAI neu scannen (deine Beschreibung bleibt erhalten).
         </p>
       )}
       {process.isError && (
@@ -213,7 +242,7 @@ function AssetDetail({
           disabled={!dirty || update.isPending}
           className="rounded-md bg-workshop-accent px-3 py-1.5 text-xs font-semibold text-workshop-bg disabled:opacity-40"
         >
-          {update.isPending ? "Speichere…" : "Beschreibung speichern"}
+          {update.isPending ? "Speichere…" : "Beschreibungen speichern"}
         </button>
         <button
           type="button"
@@ -255,17 +284,17 @@ function AssetDetail({
 function ManualEntryForm() {
   const [open, setOpen] = useState(false);
   const [title, setTitle] = useState("");
-  const [notes, setNotes] = useState("");
+  const [userNotes, setUserNotes] = useState("");
   const create = useCreateManualEntry();
 
   const handleSubmit = () => {
     if (!title.trim()) return;
     create.mutate(
-      { title: title.trim(), notes: notes.trim() || undefined },
+      { title: title.trim(), user_notes: userNotes.trim() || undefined },
       {
         onSuccess: () => {
           setTitle("");
-          setNotes("");
+          setUserNotes("");
           setOpen(false);
         },
       },
@@ -294,9 +323,9 @@ function ManualEntryForm() {
         className="rounded-md border border-workshop-border bg-workshop-bg p-1.5 text-xs"
       />
       <textarea
-        value={notes}
-        onChange={(event) => setNotes(event.target.value)}
-        placeholder="Erste Beschreibung (optional – sonst erzeugt die KI eine)"
+        value={userNotes}
+        onChange={(event) => setUserNotes(event.target.value)}
+        placeholder="Deine Beschreibung (optional – fließt in die KI-Beschreibung ein)"
         rows={2}
         className="resize-none rounded-md border border-workshop-border bg-workshop-bg p-1.5 text-xs"
       />
@@ -327,6 +356,8 @@ export function AssetLibrary() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const { data, isLoading } = useInventoryItems({ search: search || undefined });
   const processPending = useProcessPendingItems();
+  const trainKg = useTrainKnowledgeGraph();
+  const { data: kgStats } = useKnowledgeGraphStats();
 
   const selected = useMemo(
     () => data?.items.find((i) => i.id === selectedId) ?? null,
@@ -348,18 +379,45 @@ export function AssetLibrary() {
           {isLoading
             ? "Lädt…"
             : `${data?.total ?? 0} Dateien & Einträge` +
-              (scanCount > 0 ? ` · ${scanCount} ohne echte KI-Beschreibung` : "")}
+              (scanCount > 0 ? ` · ${scanCount} ohne echte KI-Beschreibung` : "") +
+              (kgStats
+                ? ` · KG: ${kgStats.nodes} Nodes / ${kgStats.learned_edges} gelernt`
+                : "")}
         </span>
-        <button
-          type="button"
-          onClick={() => processPending.mutate(50)}
-          disabled={processPending.isPending || scanCount === 0}
-          title="Neue und stub-/heuristik-beschriebene Einträge per KI scannen"
-          className="rounded-md bg-workshop-accent px-3 py-1.5 text-xs font-semibold text-workshop-bg disabled:opacity-40"
-        >
-          {processPending.isPending ? "KI scannt…" : "Scanne alle neuen DB Einträge mit KI"}
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => trainKg.mutate()}
+            disabled={trainKg.isPending}
+            title="Inventory Knowledge Graph aus aktuellen DB-Einträgen anlernen"
+            className="rounded-md border border-workshop-border px-3 py-1.5 text-xs font-semibold text-workshop-text hover:border-workshop-accent disabled:opacity-40"
+          >
+            {trainKg.isPending ? "KG lernt…" : "Knowledge Graph anlernen"}
+          </button>
+          <button
+            type="button"
+            onClick={() => processPending.mutate(50)}
+            disabled={processPending.isPending || scanCount === 0}
+            title="Neue und stub-/heuristik-beschriebene Einträge per KI scannen"
+            className="rounded-md bg-workshop-accent px-3 py-1.5 text-xs font-semibold text-workshop-bg disabled:opacity-40"
+          >
+            {processPending.isPending ? "KI scannt…" : "Scanne alle neuen DB Einträge mit KI"}
+          </button>
+        </div>
       </div>
+
+      {trainKg.isSuccess && (
+        <p className="text-xs text-workshop-success">
+          Knowledge Graph aktualisiert: {trainKg.data.nodes} Nodes, {trainKg.data.edges} Kanten
+          {trainKg.data.learned_edges != null ? ` (${trainKg.data.learned_edges} gelernt)` : ""}.
+        </p>
+      )}
+      {trainKg.isError && (
+        <p className="text-xs text-workshop-danger">
+          KG-Training fehlgeschlagen:{" "}
+          {trainKg.error instanceof Error ? trainKg.error.message : "Unbekannter Fehler"}
+        </p>
+      )}
 
       {processPending.isSuccess && (
         <p className="text-xs text-workshop-success">
@@ -388,7 +446,7 @@ export function AssetLibrary() {
           {data?.items.length === 0 && <p className="text-xs text-workshop-muted">Keine Einträge gefunden.</p>}
           {data?.items.map((item) => {
             const active = item.id === selectedId;
-            const preview = descriptionOf(item);
+            const preview = previewDescription(item);
             return (
               <button
                 key={item.id}

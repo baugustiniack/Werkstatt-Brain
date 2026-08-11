@@ -11,9 +11,20 @@ import { MigrateButton } from "./components/modelViewer/MigrateButton";
 import { AssetLibrary } from "./components/inventory/AssetLibrary";
 import { UploadDropzone } from "./components/inventory/UploadDropzone";
 import { CrawlerPanel } from "./components/inventory/CrawlerPanel";
+import { InventoryMobileQr, MobilePhotoUploadPage } from "./components/inventory/MobilePhotoUpload";
 import { LoggingPanel } from "./components/logging/LoggingPanel";
 import { AgentWorkflowPanel } from "./components/workflow/AgentWorkflowPanel";
 import type { ConversationArtifact } from "./hooks/useConversations";
+
+function useHashRoute(): string {
+  const [hash, setHash] = useState(() => window.location.hash || "#/");
+  useEffect(() => {
+    const onHash = () => setHash(window.location.hash || "#/");
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+  return hash;
+}
 
 function partsFromArtifacts(artifacts: ConversationArtifact[]): ModelViewerPart[] {
   const stls = artifacts
@@ -26,6 +37,7 @@ function partsFromArtifacts(artifacts: ConversationArtifact[]): ModelViewerPart[
 }
 
 function App() {
+  const hash = useHashRoute();
   const [prompt, setPrompt] = useState("");
   const [selectedPartIndex, setSelectedPartIndex] = useState(0);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
@@ -75,6 +87,10 @@ function App() {
   // Konzept-Freigabe läuft inline im Chat; Requirements & sonstige Gates als Dialog
   const showGenericEscalation =
     cad.escalation && cad.escalation.reason !== "concept_approval" ? cad.escalation : null;
+
+  if (hash.startsWith("#/mobile-upload")) {
+    return <MobilePhotoUploadPage />;
+  }
 
   return (
     <>
@@ -132,6 +148,7 @@ function App() {
         }
         inventory={
           <div className="flex flex-col gap-4">
+            <InventoryMobileQr />
             <AssetLibrary />
             <div className="grid grid-cols-1 gap-3 border-t border-workshop-border pt-3 md:grid-cols-2">
               <UploadDropzone />

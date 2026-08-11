@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models.unprocessed_asset import AssetFileType, AssetSource, AssetStatus, UnprocessedAsset
 from app.services import crawler, vision_ingest
+from app.services.inventory_notes import effective_ai_notes, set_ai_notes
 
 logger = logging.getLogger(__name__)
 
@@ -154,8 +155,8 @@ def save_cad_export_to_inventory(
     if existing is not None:
         merged_tags = list(dict.fromkeys([*(existing.tags or []), *tags]))
         existing.tags = merged_tags
-        if conversation_id and "Verknüpfte Unterhaltung" not in (existing.notes or ""):
-            existing.notes = ((existing.notes or "") + "\n" + notes).strip()
+        if conversation_id and "Verknüpfte Unterhaltung" not in (effective_ai_notes(existing) or ""):
+            set_ai_notes(existing, ((effective_ai_notes(existing) or "") + "\n" + notes).strip())
         if not existing.title:
             existing.title = resolved_title
         # Sicherstellen, dass KI-Tags bleiben
@@ -186,10 +187,10 @@ def save_cad_export_to_inventory(
         file_type=_file_type_for_kind(kind),
         source=AssetSource.UPLOAD,
         title=resolved_title,
-        notes=notes,
         tags=tags,
         status=AssetStatus.PENDING,
     )
+    set_ai_notes(asset, notes)
     db.add(asset)
     db.commit()
     db.refresh(asset)

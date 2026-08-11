@@ -33,6 +33,8 @@ _EXTENSION_TO_ASSET_TYPE: dict[str, AssetFileType] = {
     ".webp": AssetFileType.IMAGE,
     ".gif": AssetFileType.IMAGE,
     ".bmp": AssetFileType.IMAGE,
+    ".heic": AssetFileType.IMAGE,
+    ".heif": AssetFileType.IMAGE,
     ".tif": AssetFileType.IMAGE,
     ".tiff": AssetFileType.IMAGE,
     ".pdf": AssetFileType.PDF,

@@ -23,12 +23,16 @@ class ChatRequest(BaseModel):
     log_names: list[str] | None = Field(
         None, description="Optionale Log-Dateinamen, die bevorzugt analysiert werden sollen."
     )
-    apply_actions: bool = Field(True, description="Ob vorgeschlagene Änderungen sofort angewendet werden.")
+    apply_actions: bool = Field(
+        False,
+        description="Ignoriert – Meta-Coach hat keinen Direct Write auf den Workflow (nur Empfehlungen).",
+    )
 
 
 class ChatResponse(BaseModel):
     reply: str
     actions: list[dict[str, Any]] = []
+    recommendations: list[dict[str, Any]] = []
     applied_changes: list[dict[str, Any]] = []
     referenced_logs: list[Any] = []
     llm_configured: bool = False
@@ -57,7 +61,10 @@ def patch_workflow(body: WorkflowUpdateRequest) -> dict[str, Any]:
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     if not updates:
         raise HTTPException(status_code=400, detail="Keine Felder zum Aktualisieren.")
-    return {"config": workflow_store.update_workflow_keys(updates)}
+    try:
+        return {"config": workflow_store.update_workflow_keys(updates)}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
 @router.patch("/agents/{agent_id}")
@@ -66,6 +73,8 @@ def patch_agent(agent_id: str, body: AgentPropertyUpdate) -> dict[str, Any]:
         agent = workflow_store.update_agent_property(agent_id, body.property, body.value)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     return {"agent_id": agent_id, "agent": agent}
 
 
@@ -88,7 +97,7 @@ def coach_chat(body: ChatRequest) -> ChatResponse:
         result = meta_coach_chat.chat(
             [m.model_dump() for m in body.messages],
             log_names=body.log_names,
-            apply_actions=body.apply_actions,
+            apply_actions=False,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

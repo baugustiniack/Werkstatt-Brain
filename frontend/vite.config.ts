@@ -4,6 +4,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { VitePWA } from "vite-plugin-pwa";
 
 // Werkstatt-Brain Dashboard (SPEC Kap. 5) – Vite-Konfiguration.
+// Hinweis: Liegt js und ts parallel, hat js Vorrang – Proxy in beiden pflegen.
 export default defineConfig({
   plugins: [
     react(),
@@ -11,7 +12,6 @@ export default defineConfig({
     VitePWA({
       registerType: "autoUpdate",
       includeAssets: ["icons/*.svg"],
-      // SPEC Kap. 5.4 nennt explizit `public/manifest.json` als Manifest-Datei.
       manifestFilename: "manifest.json",
       manifest: {
         name: "Werkstatt-Brain",
@@ -27,8 +27,6 @@ export default defineConfig({
         ],
       },
       workbox: {
-        // Statische Assets fürs schnelle Laden in der Werkstatt cachen (Kap. 5.4);
-        // API-/WS-Aufrufe bewusst NICHT cachen (Live-Agenten-Daten dürfen nie stale sein).
         globPatterns: ["**/*.{js,css,html,svg,png,ico}"],
       },
     }),
@@ -37,9 +35,18 @@ export default defineConfig({
     host: true,
     port: 5173,
     strictPort: true,
+    proxy: {
+      "/api": {
+        target: process.env.VITE_PROXY_TARGET || "http://api:8000",
+        changeOrigin: true,
+        ws: true,
+      },
+      "/health": {
+        target: process.env.VITE_PROXY_TARGET || "http://api:8000",
+        changeOrigin: true,
+      },
+    },
     watch: {
-      // Docker-Bind-Mounts auf Windows-Hosts liefern keine zuverlässigen
-      // inotify-Events – ohne Polling bemerkt Vite Dateiänderungen nicht.
       usePolling: true,
     },
   },

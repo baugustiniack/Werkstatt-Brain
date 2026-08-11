@@ -75,15 +75,17 @@ class AgentState(TypedDict, total=False):
     vv_needs_alignment: bool
     # Antworten aus dem V&V-Fragen-Interview (Frage → Antwort)
     vv_qa_answers: list[dict[str, Any]]
-    # Vom Supervisor zugeschnittenes Expertenprofil + Beratung
+    # --- Flexible / Leer-Agenten ---
     flexible_specialist_profile: dict[str, Any]
     advisory_notes: str
     flexible_advice: dict[str, Any]
+    flexible_consulted: bool
+    # IDs der bereits gelaufenen Leer-Agenten (custom_agent_1 / custom_agent_2)
+    empty_agents_consulted: list[str]
     # Fertigungsbewertung + Schritt-für-Schritt-Ablauf
     manufacturing_plan: dict[str, Any]
     manufacturing_feasibility: dict[str, Any]
-    # Flags: Flexible/V&V/Fertigung bereits in dieser Phase gelaufen
-    flexible_consulted: bool
+    # Flags: V&V/Fertigung bereits in dieser Phase gelaufen
     vv_consulted_phases: list[str]
     manufacturing_assessed: bool
 

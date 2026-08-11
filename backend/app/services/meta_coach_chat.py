@@ -1,4 +1,8 @@
-"""Interaktiver Meta-Coach-Chat: analysiert Agent-Logs und passt Profile/Workflow an."""
+"""Interaktiver Meta-Coach-Chat: analysiert Agent-Logs und gibt Empfehlungen.
+
+Kein direkter Durchgriff auf den Agent-Workflow. Änderungen nimmt nur der User
+im Reiter „Agent Workflow“ vor (Workflow-DB).
+"""
 
 from __future__ import annotations
 
@@ -12,56 +16,49 @@ from typing import Any
 from agents.llm_client import call_llm_text, is_llm_configured
 from app.config import settings
 from app.services import agent_workflow_store as workflow_store
-from app.services import meta_coach as meta_coach_service
 
 logger = logging.getLogger(__name__)
 
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 
 SYSTEM_PROMPT = """Du bist der Meta-Coach des Werkstatt-Brain CAD/CAM-Multi-Agenten-Systems.
-Dein Auftrag: gemeinsam mit dem Nutzer den Sub-Agenten-Workflow analysieren und optimieren.
+Dein Auftrag: Agent-Logs analysieren und dem Nutzer konkrete Empfehlungen geben,
+wie er den Agent-Workflow optimieren kann.
+
+WICHTIG: Du hast KEINEN direkten Zugriff auf den Workflow. Du darfst nichts speichern
+oder ändern. Nur Empfehlungen – der User setzt sie manuell im Reiter „Agent Workflow“ um
+(Konfiguration speichern / aktivieren).
 
 Du hast Zugriff auf:
-1) Agent-Profile (Rollen, Eigenschaften, guidance-Texte)
-2) Workflow-Config (max_iterations, sandbox_timeout_seconds, notes)
-3) Lessons-Learned-Regeln unter rules/
-4) Zeitgestempelte Agent-Transcript-.txt-Dateien (Logging)
+1) Die aktuell aktive Workflow-Konfiguration (Profile, enabled_agents, Config) – nur lesend
+2) Zeitgestempelte Agent-Transcript-.txt-Dateien (Logging)
 
-Sub-Agenten: supervisor, flexible_specialist, vv_manager, concept_builder, inventory_manager,
-fertigung_specialist, builder_3d, validator, montage_manager, human_escalation.
-Topologie: Hub-and-Spoke – alle kehren zum Supervisor zurück; Loops laufen über refinement_request.
-Pipeline: Flexible → V&V (concept) → Concept → V&V (design) → Inventory → Fertigung → V&V (manufacturing) → 3D → Validator → Montage (Anleitung + Werkzeuge).
+Fixe Agenten (immer aktiv): nur supervisor.
+Optional: flexible_specialist, custom_agent_1, custom_agent_2 (Leer-Agenten nur via Guidance),
+vv_manager, concept_builder, inventory_manager, fertigung_specialist, builder_3d, validator,
+montage_manager, human_escalation.
+Leer-Agenten sind in der Standard-Konfiguration deaktiviert.
 
 Antworte AUSSCHLIESSLICH mit einem JSON-Objekt (kein Markdown drumherum):
 {
   "reply": "Klartext-Antwort an den Nutzer auf Deutsch (Markdown in diesem String erlaubt)",
-  "actions": [
+  "recommendations": [
     {
-      "type": "update_agent_property",
-      "agent": "builder_3d",
-      "property": "guidance",
-      "value": "..."
-    },
-    {
-      "type": "update_workflow",
-      "updates": {"max_iterations": 8, "notes": "..."}
-    },
-    {
-      "type": "add_rule",
-      "category": "geometry_conflict",
-      "signature": "kurze Fehler-Signatur",
-      "advice": "empfohlene Gegenmaßnahme",
-      "example_prompt": null
+      "type": "agent_guidance" | "enable_agent" | "disable_agent" | "workflow_config" | "process" | "other",
+      "agent": "builder_3d | null",
+      "title": "kurze Überschrift",
+      "detail": "was der User konkret im Agent-Workflow ändern sollte",
+      "priority": "high" | "medium" | "low"
     }
   ],
   "referenced_logs": ["dateiname.txt"]
 }
 
 Regeln:
-- Ändere nur, was der Nutzer will oder was klar aus Logs folgt. Bei Unsicherheit nachfragen und actions=[].
-- guidance-Texte sollen kurz, konkret und für den jeweiligen Agenten-Prompt geeignet sein.
-- max_iterations nur zwischen 1 und 50, sandbox_timeout_seconds zwischen 5 und 300.
-- category für add_rule: syntax_error | geometry_conflict | tool_mismatch | timeout | unknown
+- Nur Empfehlungen aus Log-Analyse und Workflow-Kontext. Bei Unsicherheit nachfragen und recommendations=[].
+- Keine Action-Typen zum direkten Schreiben (kein update_agent_property / update_workflow / add_rule).
+- guidance-Vorschläge kurz und umsetzbar formulieren.
+- max_iterations nur zwischen 1 und 50, sandbox_timeout_seconds zwischen 5 und 300 vorschlagen.
 """
 
 
@@ -131,80 +128,48 @@ def _gather_log_context(log_names: list[str] | None, *, max_files: int = 5, max_
 def _parse_coach_response(text: str) -> dict[str, Any]:
     match = _JSON_BLOCK.search(text.strip())
     if not match:
-        return {"reply": text.strip(), "actions": [], "referenced_logs": []}
+        return {"reply": text.strip(), "recommendations": [], "referenced_logs": [], "actions": []}
     try:
         data = json.loads(match.group(0))
     except json.JSONDecodeError:
-        return {"reply": text.strip(), "actions": [], "referenced_logs": []}
+        return {"reply": text.strip(), "recommendations": [], "referenced_logs": [], "actions": []}
     if not isinstance(data, dict):
-        return {"reply": text.strip(), "actions": [], "referenced_logs": []}
+        return {"reply": text.strip(), "recommendations": [], "referenced_logs": [], "actions": []}
+
+    recommendations = data.get("recommendations")
+    if not isinstance(recommendations, list):
+        # Legacy: actions als Empfehlungen interpretieren (nicht anwenden)
+        legacy = data.get("actions") if isinstance(data.get("actions"), list) else []
+        recommendations = []
+        for action in legacy:
+            if not isinstance(action, dict):
+                continue
+            recommendations.append(
+                {
+                    "type": str(action.get("type") or "other"),
+                    "agent": action.get("agent"),
+                    "title": f"Empfehlung: {action.get('type')}",
+                    "detail": json.dumps(action, ensure_ascii=False)[:800],
+                    "priority": "medium",
+                }
+            )
+
     return {
         "reply": str(data.get("reply") or "").strip() or text.strip(),
-        "actions": data.get("actions") if isinstance(data.get("actions"), list) else [],
+        "recommendations": recommendations,
         "referenced_logs": data.get("referenced_logs") if isinstance(data.get("referenced_logs"), list) else [],
+        # Kompatibilität: leere actions – kein Direct Write
+        "actions": [],
     }
-
-
-def _apply_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    applied: list[dict[str, Any]] = []
-    for action in actions:
-        if not isinstance(action, dict):
-            continue
-        kind = action.get("type")
-        try:
-            if kind == "update_agent_property":
-                agent = str(action.get("agent") or "")
-                prop = str(action.get("property") or "")
-                if not agent or not prop:
-                    continue
-                workflow_store.update_agent_property(agent, prop, action.get("value"))
-                applied.append({"type": kind, "agent": agent, "property": prop, "status": "ok"})
-            elif kind == "update_workflow":
-                updates = action.get("updates") or {}
-                if not isinstance(updates, dict):
-                    continue
-                workflow_store.update_workflow_keys(updates)
-                applied.append({"type": kind, "updates": updates, "status": "ok"})
-            elif kind == "add_rule":
-                category = str(action.get("category") or "unknown")
-                signature = str(action.get("signature") or "").strip()
-                if not signature:
-                    continue
-
-                class _FakeLog:
-                    session_id = "meta-coach-chat"
-                    error_traceback = signature
-                    error_message = signature
-                    prompt = action.get("example_prompt")
-
-                path = meta_coach_service.update_rule_for_category(category, _FakeLog())  # type: ignore[arg-type]
-                # Optional advice anhängen
-                advice = action.get("advice")
-                if advice:
-                    doc = meta_coach_service.load_rules(category)
-                    for rule in doc.get("rules") or []:
-                        if rule.get("signature") == signature:
-                            rule["advice"] = advice
-                            break
-                    meta_coach_service.save_rules(category, doc)
-                applied.append(
-                    {"type": kind, "category": category, "signature": signature, "path": str(path), "status": "ok"}
-                )
-            else:
-                applied.append({"type": kind, "status": "ignored", "reason": "unbekannter action-type"})
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Meta-Coach-Action fehlgeschlagen (%s): %s", kind, exc)
-            applied.append({"type": kind, "status": "error", "error": str(exc)})
-    return applied
 
 
 def chat(
     messages: list[dict[str, str]],
     *,
     log_names: list[str] | None = None,
-    apply_actions: bool = True,
+    apply_actions: bool = False,  # noqa: ARG001 – absichtlich ignoriert (kein Direct Write)
 ) -> dict[str, Any]:
-    """Führt einen Meta-Coach-Turn aus. `messages` = Chat-Historie inkl. neuester User-Nachricht."""
+    """Führt einen Meta-Coach-Turn aus. Schreibt nie in den Workflow."""
     if not messages:
         raise ValueError("messages darf nicht leer sein.")
 
@@ -213,7 +178,7 @@ def chat(
     log_context = _gather_log_context(log_names)
 
     user_bundle = (
-        "## Aktueller Workflow / Profile\n"
+        "## Aktive Workflow-Konfiguration (nur lesend)\n"
         f"```json\n{json.dumps(overview, ensure_ascii=False, indent=2)[:12000]}\n```\n\n"
         "## Verfügbare Log-Dateien (Index)\n"
         f"```json\n{json.dumps(log_index, ensure_ascii=False, indent=2)[:4000]}\n```\n\n"
@@ -230,12 +195,12 @@ def chat(
         return {
             "reply": (
                 "Kein LLM-Provider konfiguriert. Bitte unter Einstellungen einen Anthropic- "
-                "oder Cursor-API-Key hinterlegen, damit der Meta-Coach Logs analysieren und "
-                "Profile anpassen kann.\n\n"
+                "oder Cursor-API-Key hinterlegen, damit der Meta-Coach Logs analysieren kann.\n\n"
                 f"Aktuell {len(log_index)} Log-Datei(en) verfügbar. "
-                "Workflow-Profile können trotzdem manuell über die API gelesen werden."
+                "Workflow-Änderungen nimmst du im Reiter „Agent Workflow“ vor."
             ),
             "actions": [],
+            "recommendations": [],
             "applied_changes": [],
             "referenced_logs": log_names or [],
             "llm_configured": False,
@@ -243,15 +208,25 @@ def chat(
 
     raw = call_llm_text(SYSTEM_PROMPT, user_bundle, max_tokens=4096)
     parsed = _parse_coach_response(raw)
-    applied: list[dict[str, Any]] = []
-    if apply_actions and parsed["actions"]:
-        applied = _apply_actions(parsed["actions"])
+
+    reply = parsed["reply"]
+    recs = parsed.get("recommendations") or []
+    if recs:
+        bullets = "\n".join(
+            f"- **{r.get('title') or r.get('type')}** ({r.get('priority') or 'medium'}): "
+            f"{r.get('detail') or ''}"
+            for r in recs
+            if isinstance(r, dict)
+        )
+        if bullets and "Empfehlung" not in reply[:80]:
+            reply = f"{reply}\n\n### Empfehlungen für den Agent-Workflow\n{bullets}"
 
     return {
-        "reply": parsed["reply"],
-        "actions": parsed["actions"],
-        "applied_changes": applied,
+        "reply": reply,
+        "actions": [],
+        "recommendations": recs,
+        "applied_changes": [],
         "referenced_logs": parsed["referenced_logs"],
         "llm_configured": True,
-        "workflow": workflow_store.workflow_overview() if applied else None,
+        "workflow": None,
     }

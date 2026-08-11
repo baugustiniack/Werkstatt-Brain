@@ -90,3 +90,30 @@ export function useSaveConceptToInventory() {
     },
   });
 }
+
+export interface KnowledgeGraphStats {
+  nodes: number;
+  edges: number;
+  learned_edges: number;
+  by_type: Record<string, number>;
+  trained_at?: string | null;
+  updated_at?: string | null;
+  path?: string;
+}
+
+export function useKnowledgeGraphStats() {
+  return useQuery({
+    queryKey: ["inventory-knowledge-graph"],
+    queryFn: () => api.get<KnowledgeGraphStats>("/api/v1/inventory/knowledge-graph"),
+    refetchInterval: 60_000,
+  });
+}
+
+/** Baut den Inventory Knowledge Graph aus aktuellen DB-Einträgen neu auf. */
+export function useTrainKnowledgeGraph() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<KnowledgeGraphStats>("/api/v1/inventory/knowledge-graph/train", {}),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["inventory-knowledge-graph"] }),
+  });
+}

@@ -28,7 +28,17 @@ DEFAULT_EDGES: list[dict[str, Any]] = [
     {
         "from": "supervisor",
         "to": "flexible_specialist",
-        "when": "noch nicht flexible_consulted – anfragespezifisches Expertenprofil",
+        "when": "noch nicht flexible_consulted und Agent enabled",
+    },
+    {
+        "from": "supervisor",
+        "to": "custom_agent_1",
+        "when": "Leer-Agent 1 enabled und noch nicht in empty_agents_consulted",
+    },
+    {
+        "from": "supervisor",
+        "to": "custom_agent_2",
+        "when": "Leer-Agent 2 enabled und noch nicht in empty_agents_consulted",
     },
     {
         "from": "supervisor",
@@ -48,7 +58,7 @@ DEFAULT_EDGES: list[dict[str, Any]] = [
     {
         "from": "supervisor",
         "to": "inventory_manager",
-        "when": "Konzept freigegeben, noch kein stock_and_tool_context",
+        "when": "Konzept freigegeben, noch kein stock_and_tool_context (wenn enabled)",
     },
     {
         "from": "supervisor",
@@ -79,6 +89,16 @@ DEFAULT_EDGES: list[dict[str, Any]] = [
         "from": "flexible_specialist",
         "to": "supervisor",
         "when": "Profil + Advisory-Notes gesetzt",
+    },
+    {
+        "from": "custom_agent_1",
+        "to": "supervisor",
+        "when": "Guidance ausgeführt bzw. leer übersprungen",
+    },
+    {
+        "from": "custom_agent_2",
+        "to": "supervisor",
+        "when": "Guidance ausgeführt bzw. leer übersprungen",
     },
     {
         "from": "vv_manager",
@@ -158,7 +178,35 @@ DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
         "outputs": ["flexible_specialist_profile", "advisory_notes", "flexible_advice"],
         "properties": {
             "guidance": "",
-            "notes": "Immer früh im Lauf; Profil bleibt für die Session bestehen.",
+            "notes": "Optional; wenn deaktiviert, setzt der Supervisor flexible_consulted und überspringt.",
+        },
+    },
+    "custom_agent_1": {
+        "display_name": "Leer-Agent 1",
+        "role": "Leerer Slot – Rolle ausschließlich über manuelle Guidance.",
+        "responsibilities": [
+            "Führt nur die hinterlegte Guidance aus",
+            "Schreibt Ergebnis in advisory_notes für nachfolgende Agenten",
+        ],
+        "inputs": ["user_prompt", "guidance", "advisory_notes"],
+        "outputs": ["advisory_notes", "empty_agents_consulted"],
+        "properties": {
+            "guidance": "",
+            "notes": "In der Standard-Konfiguration deaktiviert. Guidance im Agent Workflow setzen, dann aktivieren.",
+        },
+    },
+    "custom_agent_2": {
+        "display_name": "Leer-Agent 2",
+        "role": "Leerer Slot – Rolle ausschließlich über manuelle Guidance.",
+        "responsibilities": [
+            "Führt nur die hinterlegte Guidance aus",
+            "Schreibt Ergebnis in advisory_notes für nachfolgende Agenten",
+        ],
+        "inputs": ["user_prompt", "guidance", "advisory_notes"],
+        "outputs": ["advisory_notes", "empty_agents_consulted"],
+        "properties": {
+            "guidance": "",
+            "notes": "In der Standard-Konfiguration deaktiviert. Guidance im Agent Workflow setzen, dann aktivieren.",
         },
     },
     "vv_manager": {
@@ -201,18 +249,29 @@ DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
     },
     "inventory_manager": {
         "display_name": "Inventory Specialist",
-        "role": "Passt Contract an verfügbares Material/Werkzeug an und injiziert Kontext.",
+        "role": "Passt Contract an verfügbares Material/Werkzeug an; nutzt DB + Knowledge Graph.",
         "responsibilities": [
-            "Stock- und Tool-Matching",
+            "Stock- und Tool-Matching direkt gegen die Inventar-DB",
+            "Abfrage des Inventory Knowledge Graphs (gelernte Assoziationen)",
+            "Nach Matches: Graph-Kanten verstärken (Lernfähigkeit)",
             "Lessons-Learned-Regeln laden",
             "CONTEXT_INJECTION für Fertigung und 3D Builder",
         ],
-        "inputs": ["requirements_contract", "Inventar-DB", "Asset-Beschreibungen (notes)", "rules/*.json"],
-        "outputs": ["stock_and_tool_context", "ggf. angepasster Contract"],
+        "inputs": [
+            "requirements_contract",
+            "Inventar-DB",
+            "inventory_knowledge_graph.json",
+            "Asset-Beschreibungen (notes)",
+            "rules/*.json",
+        ],
+        "outputs": ["stock_and_tool_context", "ggf. angepasster Contract", "KG-Lern-Update"],
         "properties": {
             "guidance": "",
             "strict_tool_match": False,
-            "notes": "",
+            "notes": (
+                "Optional zuschaltbar. Graph wird per POST /inventory/knowledge-graph/train "
+                "aus der DB aufgebaut; Matches verstärken learned edges."
+            ),
         },
     },
     "fertigung_specialist": {
@@ -370,7 +429,7 @@ def load_agent_profiles() -> dict[str, Any]:
                     edge_nodes.add(e.get("from"))
                     edge_nodes.add(e.get("to"))
         # Alte Topologie ohne V&V/Flexible/Fertigung/Montage → Defaults
-        if not raw_edges or "vv_manager" not in edge_nodes or "montage_manager" not in edge_nodes:
+        if not raw_edges or "vv_manager" not in edge_nodes or "montage_manager" not in edge_nodes or "custom_agent_1" not in edge_nodes:
             edges = deepcopy(DEFAULT_EDGES)
         else:
             edges = raw_edges
@@ -415,6 +474,17 @@ def save_workflow_config(doc: dict[str, Any]) -> Path:
 
 
 def get_agent_guidance(agent_id: str) -> str:
+    try:
+        from app.services import agent_workflow_db as wf_db
+
+        active = wf_db.get_active_config()
+        agent = (active.get("agents") or {}).get(agent_id) or {}
+        props = agent.get("properties") or {}
+        guidance = (props.get("guidance") or "").strip()
+        if guidance:
+            return guidance
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Aktive Workflow-DB guidance nicht lesbar: %s", exc)
     profiles = load_agent_profiles()
     agent = (profiles.get("agents") or {}).get(agent_id) or {}
     props = agent.get("properties") or {}
@@ -422,7 +492,38 @@ def get_agent_guidance(agent_id: str) -> str:
     return guidance
 
 
+def get_enabled_agents() -> set[str]:
+    """Aktive Agenten-IDs laut Workflow-DB (fixe Agenten immer enthalten)."""
+    from app.models.agent_workflow_config import FIXED_AGENT_IDS
+
+    try:
+        from app.services import agent_workflow_db as wf_db
+
+        active = wf_db.get_active_config()
+        enabled = set(active.get("enabled_agents") or [])
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("enabled_agents aus DB nicht lesbar: %s", exc)
+        enabled = set(DEFAULT_AGENTS.keys())
+    return enabled | set(FIXED_AGENT_IDS)
+
+
+def is_agent_enabled(agent_id: str) -> bool:
+    from app.models.agent_workflow_config import FIXED_AGENT_IDS
+
+    if agent_id in FIXED_AGENT_IDS:
+        return True
+    return agent_id in get_enabled_agents()
+
+
 def get_max_iterations() -> int:
+    try:
+        from app.services import agent_workflow_db as wf_db
+
+        cfg = wf_db.get_active_config().get("config") or {}
+        value = int(cfg.get("max_iterations", settings.agent_max_iterations))
+        return max(1, min(value, 50))
+    except Exception:  # noqa: BLE001
+        pass
     cfg = load_workflow_config()
     try:
         value = int(cfg.get("max_iterations", settings.agent_max_iterations))
@@ -432,6 +533,14 @@ def get_max_iterations() -> int:
 
 
 def get_sandbox_timeout() -> int:
+    try:
+        from app.services import agent_workflow_db as wf_db
+
+        cfg = wf_db.get_active_config().get("config") or {}
+        value = int(cfg.get("sandbox_timeout_seconds", settings.sandbox_timeout_seconds))
+        return max(5, min(value, 300))
+    except Exception:  # noqa: BLE001
+        pass
     cfg = load_workflow_config()
     try:
         value = int(cfg.get("sandbox_timeout_seconds", settings.sandbox_timeout_seconds))
@@ -441,32 +550,68 @@ def get_sandbox_timeout() -> int:
 
 
 def update_agent_property(agent_id: str, property_key: str, value: Any) -> dict[str, Any]:
-    doc = load_agent_profiles()
-    agents = doc.setdefault("agents", {})
-    if agent_id not in agents:
-        raise KeyError(f"Unbekannter Agent: {agent_id}")
-    props = agents[agent_id].setdefault("properties", {})
-    props[property_key] = value
-    save_agent_profiles(doc)
-    return agents[agent_id]
+    """Schreibt in die aktive Workflow-DB-Konfiguration (nicht via Meta-Coach)."""
+    from app.services import agent_workflow_db as wf_db
+
+    try:
+        return wf_db.update_active_agent_property(agent_id, property_key, value)
+    except PermissionError:
+        # Fallback: JSON-Datei (Legacy), wenn nur Standard aktiv
+        doc = load_agent_profiles()
+        agents = doc.setdefault("agents", {})
+        if agent_id not in agents:
+            raise KeyError(f"Unbekannter Agent: {agent_id}") from None
+        props = agents[agent_id].setdefault("properties", {})
+        props[property_key] = value
+        save_agent_profiles(doc)
+        return agents[agent_id]
 
 
 def update_workflow_keys(updates: dict[str, Any]) -> dict[str, Any]:
-    cfg = load_workflow_config()
+    from app.services import agent_workflow_db as wf_db
+
     allowed = {"max_iterations", "sandbox_timeout_seconds", "description", "notes"}
-    for key, value in updates.items():
-        if key in allowed:
+    filtered = {k: v for k, v in updates.items() if k in allowed}
+    try:
+        row = wf_db.update_active(config=filtered)
+        return row.get("config") or filtered
+    except PermissionError:
+        cfg = load_workflow_config()
+        for key, value in filtered.items():
             cfg[key] = value
-    save_workflow_config(cfg)
-    return cfg
+        save_workflow_config(cfg)
+        return cfg
 
 
 def workflow_overview() -> dict[str, Any]:
-    profiles = load_agent_profiles()
-    config = load_workflow_config()
-    return {
-        "agents": profiles.get("agents", {}),
-        "edges": profiles.get("edges", []),
-        "config": config,
-        "profiles_updated_at": profiles.get("updated_at"),
-    }
+    try:
+        from app.services import agent_workflow_db as wf_db
+
+        active = wf_db.get_active_config()
+        return {
+            "agents": active.get("agents") or {},
+            "edges": active.get("edges") or [],
+            "config": active.get("config") or {},
+            "enabled_agents": active.get("enabled_agents") or [],
+            "fixed_agents": active.get("fixed_agents") or ["supervisor"],
+            "active_config": {
+                "id": active.get("id"),
+                "name": active.get("name"),
+                "is_standard": active.get("is_standard"),
+                "description": active.get("description"),
+            },
+            "profiles_updated_at": active.get("updated_at"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Workflow-Übersicht aus DB fehlgeschlagen: %s", exc)
+        profiles = load_agent_profiles()
+        config = load_workflow_config()
+        return {
+            "agents": profiles.get("agents", {}),
+            "edges": profiles.get("edges", []),
+            "config": config,
+            "enabled_agents": [a for a in DEFAULT_AGENTS if a not in {"custom_agent_1", "custom_agent_2"}],
+            "fixed_agents": ["supervisor"],
+            "active_config": None,
+            "profiles_updated_at": profiles.get("updated_at"),
+        }

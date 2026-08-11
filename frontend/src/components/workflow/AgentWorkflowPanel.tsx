@@ -1,17 +1,21 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 
 import {
-  useMetaCoachChat,
-  useMetaCoachLogs,
+  useActivateStandardWorkflow,
+  useActivateWorkflow,
+  useAgentWorkflowConfigs,
+  useDeleteWorkflowConfig,
+  useSaveWorkflowConfig,
   useWorkflowOverview,
   type AgentProfile,
-  type MetaCoachChatMessage,
   type WorkflowEdge,
 } from "../../hooks/useMetaCoach";
 
 const AGENT_ORDER = [
   "supervisor",
   "flexible_specialist",
+  "custom_agent_1",
+  "custom_agent_2",
   "vv_manager",
   "concept_builder",
   "inventory_manager",
@@ -22,15 +26,21 @@ const AGENT_ORDER = [
   "human_escalation",
 ] as const;
 
+const FIXED = new Set(["supervisor"]);
+
 function AgentCard({
   id,
   agent,
   selected,
+  enabled,
+  fixed,
   onSelect,
 }: {
   id: string;
   agent: AgentProfile;
   selected: boolean;
+  enabled: boolean;
+  fixed: boolean;
   onSelect: () => void;
 }) {
   return (
@@ -41,19 +51,37 @@ function AgentCard({
         selected
           ? "border-workshop-accent bg-workshop-accent/15"
           : "border-workshop-border bg-workshop-bg/40 hover:border-workshop-muted"
-      }`}
+      } ${!enabled ? "opacity-50" : ""}`}
     >
-      <div className="text-xs font-semibold text-workshop-text">{agent.display_name}</div>
+      <div className="flex items-center justify-between gap-1">
+        <div className="text-xs font-semibold text-workshop-text">{agent.display_name}</div>
+        {fixed ? (
+          <span className="text-[9px] font-mono uppercase text-workshop-accent">fix</span>
+        ) : (
+          <span className="text-[9px] font-mono uppercase text-workshop-muted">
+            {enabled ? "an" : "aus"}
+          </span>
+        )}
+      </div>
       <div className="mt-0.5 line-clamp-2 text-[10px] text-workshop-muted">{agent.role}</div>
     </button>
   );
 }
 
-function WorkflowDiagram({ edges }: { edges: WorkflowEdge[] }) {
+function WorkflowDiagram({
+  edges,
+  enabledAgents,
+}: {
+  edges: WorkflowEdge[];
+  enabledAgents: string[];
+}) {
+  const enabled = new Set(enabledAgents);
   const mainFlow = [
     "START",
     "supervisor",
     "flexible_specialist",
+    "custom_agent_1",
+    "custom_agent_2",
     "vv_manager",
     "concept_builder",
     "inventory_manager",
@@ -63,278 +91,396 @@ function WorkflowDiagram({ edges }: { edges: WorkflowEdge[] }) {
     "montage_manager",
     "END",
   ];
-  const loopEdges = edges.filter((e) => e.loop);
 
   return (
-    <div className="space-y-3 rounded-md border border-workshop-border bg-black/20 p-3">
+    <div className="space-y-2 rounded-md border border-workshop-border bg-black/20 p-3">
       <div className="text-[10px] font-mono uppercase tracking-wider text-workshop-muted">
-        Hub-and-Spoke · Supervisor als Router
+        Pipeline (Entwurf)
       </div>
       <div className="flex flex-wrap items-center gap-1.5">
-        {mainFlow.map((node, idx) => (
-          <div key={node} className="flex items-center gap-1.5">
-            <span
-              className={`rounded border px-2 py-1 font-mono text-[10px] ${
-                node === "supervisor"
-                  ? "border-workshop-accent text-workshop-accent"
-                  : "border-workshop-border text-workshop-muted"
-              }`}
-            >
-              {node}
-            </span>
-            {idx < mainFlow.length - 1 && <span className="text-workshop-muted">→</span>}
-          </div>
-        ))}
-      </div>
-      <p className="text-[11px] text-workshop-muted">
-        Jeder Fach-Agent kehrt nach seiner Arbeit zum <strong className="text-workshop-text">Supervisor</strong>{" "}
-        zurück. Korrekturschleifen laufen über <code className="text-workshop-accent">refinement_request</code>.
-      </p>
-      {loopEdges.length > 0 && (
-        <div className="space-y-1 border-t border-workshop-border/60 pt-2">
-          <div className="text-[10px] font-mono uppercase text-workshop-muted">Loops</div>
-          {loopEdges.map((e, i) => (
-            <div key={`${e.from}-${e.to}-${i}`} className="text-[11px] text-workshop-text">
-              <span className="font-mono text-workshop-accent">
-                {e.from} ↻ {e.to}
+        {mainFlow.map((node, idx) => {
+          const off = node !== "START" && node !== "END" && !enabled.has(node);
+          return (
+            <div key={node} className="flex items-center gap-1.5">
+              <span
+                className={`rounded border px-2 py-1 font-mono text-[10px] ${
+                  node === "supervisor"
+                    ? "border-workshop-accent text-workshop-accent"
+                    : off
+                      ? "border-workshop-border/40 text-workshop-muted line-through"
+                      : "border-workshop-border text-workshop-muted"
+                }`}
+              >
+                {node}
               </span>
-              {e.when ? <span className="text-workshop-muted"> — {e.when}</span> : null}
+              {idx < mainFlow.length - 1 && <span className="text-workshop-muted">→</span>}
             </div>
-          ))}
-        </div>
+          );
+        })}
+      </div>
+      {edges.some((e) => e.loop) && (
+        <p className="text-[10px] text-workshop-muted">Loops über refinement_request · Supervisor als Router</p>
       )}
     </div>
   );
 }
 
-function AgentDetail({ id, agent }: { id: string; agent: AgentProfile }) {
-  const guidance = String(agent.properties?.guidance ?? "");
-  const notes = String(agent.properties?.notes ?? "");
-
-  return (
-    <div className="space-y-3 rounded-md border border-workshop-border bg-workshop-bg/50 p-3 text-xs">
-      <div>
-        <div className="font-semibold text-workshop-text">{agent.display_name}</div>
-        <div className="mt-1 text-workshop-muted">{agent.role}</div>
-        <div className="mt-1 font-mono text-[10px] text-workshop-muted">{id}</div>
-      </div>
-      {agent.responsibilities && agent.responsibilities.length > 0 && (
-        <div>
-          <div className="mb-1 text-[10px] font-mono uppercase text-workshop-muted">Aufgaben</div>
-          <ul className="list-inside list-disc space-y-0.5 text-workshop-text">
-            {agent.responsibilities.map((r) => (
-              <li key={r}>{r}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-      <div className="grid gap-2 sm:grid-cols-2">
-        <div>
-          <div className="mb-1 text-[10px] font-mono uppercase text-workshop-muted">Inputs</div>
-          <p className="text-workshop-text">{(agent.inputs ?? []).join(", ") || "—"}</p>
-        </div>
-        <div>
-          <div className="mb-1 text-[10px] font-mono uppercase text-workshop-muted">Outputs</div>
-          <p className="text-workshop-text">{(agent.outputs ?? []).join(", ") || "—"}</p>
-        </div>
-      </div>
-      <div>
-        <div className="mb-1 text-[10px] font-mono uppercase text-workshop-muted">Meta-Coach Guidance</div>
-        <pre className="max-h-28 overflow-auto whitespace-pre-wrap rounded border border-workshop-border bg-black/30 p-2 text-[11px] text-workshop-text">
-          {guidance || "(noch keine – Meta-Coach kann sie setzen)"}
-        </pre>
-      </div>
-      {notes && (
-        <div>
-          <div className="mb-1 text-[10px] font-mono uppercase text-workshop-muted">Notizen</div>
-          <p className="text-workshop-muted">{notes}</p>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** Reiter Agent Workflow: Topologie + Eigenschaften + Meta-Coach-Chat. */
+/** Reiter Agent Workflow: schmale DB-Spalte + Entwurf bearbeiten, dann mit Namen speichern. */
 export function AgentWorkflowPanel() {
   const { data: workflow, isLoading, refetch } = useWorkflowOverview();
-  const { data: logs = [] } = useMetaCoachLogs();
-  const chatMutation = useMetaCoachChat();
+  const { data: configs = [], refetch: refetchConfigs } = useAgentWorkflowConfigs();
+  const activate = useActivateWorkflow();
+  const activateStandard = useActivateStandardWorkflow();
+  const saveAs = useSaveWorkflowConfig();
+  const deleteCfg = useDeleteWorkflowConfig();
 
-  const [selectedAgentId, setSelectedAgentId] = useState<string>("supervisor");
-  const [selectedLogs, setSelectedLogs] = useState<string[]>([]);
-  const [messages, setMessages] = useState<MetaCoachChatMessage[]>([]);
-  const [draft, setDraft] = useState("");
-  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const [selectedAgentId, setSelectedAgentId] = useState("supervisor");
+  const [draftAgents, setDraftAgents] = useState<Record<string, AgentProfile>>({});
+  const [draftEnabled, setDraftEnabled] = useState<string[]>([]);
+  const [draftMaxIter, setDraftMaxIter] = useState(6);
+  const [draftTimeout, setDraftTimeout] = useState(20);
+  const [draftGuidance, setDraftGuidance] = useState("");
+  const [dirty, setDirty] = useState(false);
+  const [saveName, setSaveName] = useState("");
+  const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [syncKey, setSyncKey] = useState<string | null>(null);
 
-  const agents = workflow?.agents ?? {};
+  const activeId = workflow?.active_config?.id ?? null;
+  const activeName = workflow?.active_config?.name ?? null;
+  const isStandardActive = Boolean(workflow?.active_config?.is_standard);
+
+  // Server-Stand → lokaler Entwurf (nur wenn nicht dirty / neuer Sync)
+  useEffect(() => {
+    if (!workflow?.agents) return;
+    const key = `${activeId ?? "none"}:${workflow.profiles_updated_at ?? ""}`;
+    if (dirty && syncKey === key) return;
+    setDraftAgents(workflow.agents);
+    setDraftEnabled(workflow.enabled_agents ?? Object.keys(workflow.agents));
+    setDraftMaxIter(workflow.config?.max_iterations ?? 6);
+    setDraftTimeout(workflow.config?.sandbox_timeout_seconds ?? 20);
+    setDirty(false);
+    setSyncKey(key);
+    if (!isStandardActive && activeName) {
+      setSaveName(activeName);
+    } else {
+      setSaveName("");
+    }
+  }, [workflow, activeId, activeName, isStandardActive, dirty, syncKey]);
+
+  useEffect(() => {
+    const agent = draftAgents[selectedAgentId];
+    setDraftGuidance(String(agent?.properties?.guidance ?? ""));
+  }, [selectedAgentId, draftAgents]);
+
   const orderedIds = useMemo(() => {
-    const keys = Object.keys(agents);
+    const keys = Object.keys(draftAgents);
     return [
-      ...AGENT_ORDER.filter((id) => id in agents),
+      ...AGENT_ORDER.filter((id) => id in draftAgents),
       ...keys.filter((id) => !(AGENT_ORDER as readonly string[]).includes(id)),
     ];
-  }, [agents]);
+  }, [draftAgents]);
 
-  useEffect(() => {
-    if (!selectedAgentId && orderedIds.length) setSelectedAgentId(orderedIds[0]);
-  }, [orderedIds, selectedAgentId]);
+  const selectedAgent = draftAgents[selectedAgentId];
+  const busy = activate.isPending || activateStandard.isPending || saveAs.isPending || deleteCfg.isPending;
 
-  useEffect(() => {
-    chatScrollRef.current?.scrollTo({ top: chatScrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages.length, chatMutation.isPending]);
+  const markDirty = () => setDirty(true);
 
-  const selectedAgent = agents[selectedAgentId];
-
-  const toggleLog = (name: string) => {
-    setSelectedLogs((prev) => (prev.includes(name) ? prev.filter((n) => n !== name) : [...prev, name]));
+  const flash = (ok: string | null, err: string | null) => {
+    setStatusMsg(ok);
+    setErrorMsg(err);
   };
 
-  const handleSend = async (event: FormEvent) => {
-    event.preventDefault();
-    const text = draft.trim();
-    if (!text || chatMutation.isPending) return;
-    const nextMessages: MetaCoachChatMessage[] = [...messages, { role: "user", content: text }];
-    setMessages(nextMessages);
-    setDraft("");
-    try {
-      const result = await chatMutation.mutateAsync({
-        messages: nextMessages,
-        log_names: selectedLogs.length ? selectedLogs : undefined,
-        apply_actions: true,
-      });
-      setMessages((prev) => [...prev, { role: "assistant", content: result.reply }]);
-      if (result.applied_changes?.length) {
-        void refetch();
-      }
-    } catch (err) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: `Fehler: ${err instanceof Error ? err.message : "Meta-Coach nicht erreichbar."}`,
+  const loadConfig = (id: string, isStandard: boolean) => {
+    const done = () => {
+      setDirty(false);
+      setSyncKey(null);
+      void refetch();
+      void refetchConfigs();
+      flash(null, null);
+    };
+    if (isStandard) {
+      activateStandard.mutate(undefined, {
+        onSuccess: () => {
+          done();
+          flash("Standard geladen.", null);
         },
-      ]);
+        onError: (e) => flash(null, e instanceof Error ? e.message : "Laden fehlgeschlagen"),
+      });
+    } else {
+      activate.mutate(id, {
+        onSuccess: (row) => {
+          done();
+          setSaveName(row.name);
+          flash(`„${row.name}“ geladen.`, null);
+        },
+        onError: (e) => flash(null, e instanceof Error ? e.message : "Laden fehlgeschlagen"),
+      });
     }
   };
 
+  const toggleAgent = (id: string) => {
+    if (FIXED.has(id)) return;
+    setDraftEnabled((prev) => (prev.includes(id) ? prev.filter((a) => a !== id) : [...prev, id]));
+    markDirty();
+  };
+
+  const applyGuidanceToDraft = () => {
+    setDraftAgents((prev) => {
+      const agent = prev[selectedAgentId];
+      if (!agent) return prev;
+      return {
+        ...prev,
+        [selectedAgentId]: {
+          ...agent,
+          properties: { ...(agent.properties ?? {}), guidance: draftGuidance },
+        },
+      };
+    });
+    markDirty();
+    flash("Guidance im Entwurf übernommen – noch speichern.", null);
+  };
+
+  const handleSave = (event: FormEvent) => {
+    event.preventDefault();
+    const name = saveName.trim();
+    if (!name) {
+      flash(null, "Bitte einen Namen für die Konfiguration vergeben.");
+      return;
+    }
+    if (name.toLowerCase() === "standard") {
+      flash(null, "Name „Standard“ ist reserviert.");
+      return;
+    }
+    // Guidance des aktuellen Agenten mitnehmen
+    const agents = { ...draftAgents };
+    if (agents[selectedAgentId]) {
+      agents[selectedAgentId] = {
+        ...agents[selectedAgentId],
+        properties: { ...(agents[selectedAgentId].properties ?? {}), guidance: draftGuidance },
+      };
+    }
+    saveAs.mutate(
+      {
+        name,
+        agents,
+        enabled_agents: draftEnabled,
+        config: {
+          max_iterations: draftMaxIter,
+          sandbox_timeout_seconds: draftTimeout,
+        },
+        activate: true,
+      },
+      {
+        onSuccess: (row) => {
+          setDirty(false);
+          setSyncKey(null);
+          setSaveName(row.name);
+          void refetch();
+          void refetchConfigs();
+          flash(`„${row.name}“ gespeichert und aktiv.`, null);
+        },
+        onError: (e) => flash(null, e instanceof Error ? e.message : "Speichern fehlgeschlagen"),
+      },
+    );
+  };
+
   return (
-    <div className="grid h-full min-h-0 grid-cols-1 gap-3 xl:grid-cols-2">
-      {/* Links: Topologie + Agenten */}
-      <div className="flex min-h-0 flex-col gap-3 overflow-y-auto">
-        {isLoading && <p className="text-xs text-workshop-muted">Lade Workflow…</p>}
-        {workflow && (
-          <>
-            <WorkflowDiagram edges={workflow.edges} />
-            <div className="rounded-md border border-workshop-border bg-workshop-bg/40 p-3 text-xs">
-              <div className="mb-2 text-[10px] font-mono uppercase text-workshop-muted">Laufzeit-Config</div>
-              <div className="flex flex-wrap gap-3 text-workshop-text">
-                <span>
-                  max_iterations:{" "}
-                  <strong className="text-workshop-accent">{workflow.config.max_iterations}</strong>
-                </span>
-                <span>
-                  sandbox_timeout:{" "}
-                  <strong className="text-workshop-accent">{workflow.config.sandbox_timeout_seconds}s</strong>
-                </span>
+    <div className="flex h-full min-h-0 gap-3">
+      {/* Schmale Spalte: gespeicherte Konfigurationen */}
+      <aside className="flex w-40 shrink-0 flex-col gap-2 border-r border-workshop-border pr-2 sm:w-44">
+        <div className="text-[10px] font-mono uppercase tracking-wider text-workshop-muted">
+          Gespeichert
+        </div>
+        <div className="min-h-0 flex-1 space-y-1 overflow-y-auto">
+          {configs.map((c) => {
+            const active = c.is_active;
+            return (
+              <div
+                key={c.id}
+                className={`group rounded-md border px-2 py-1.5 ${
+                  active
+                    ? "border-workshop-accent bg-workshop-accent/15"
+                    : "border-workshop-border hover:border-workshop-muted"
+                }`}
+              >
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => loadConfig(c.id, c.is_standard)}
+                  className="w-full text-left disabled:opacity-50"
+                  title={c.description || c.name}
+                >
+                  <div className="truncate text-xs font-semibold text-workshop-text">{c.name}</div>
+                  <div className="text-[9px] text-workshop-muted">
+                    {c.is_standard ? "Standard" : "User"}
+                    {active ? " · aktiv" : ""}
+                  </div>
+                </button>
+                {!c.is_standard && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() =>
+                      deleteCfg.mutate(c.id, {
+                        onSuccess: () => {
+                          void refetch();
+                          void refetchConfigs();
+                          flash(`„${c.name}“ gelöscht.`, null);
+                        },
+                        onError: (e) =>
+                          flash(null, e instanceof Error ? e.message : "Löschen fehlgeschlagen"),
+                      })
+                    }
+                    className="mt-1 text-[9px] text-workshop-danger opacity-70 hover:opacity-100 disabled:opacity-40"
+                  >
+                    Löschen
+                  </button>
+                )}
               </div>
-              {workflow.config.description && (
-                <p className="mt-2 text-workshop-muted">{workflow.config.description}</p>
-              )}
-              {workflow.config.notes && (
-                <p className="mt-1 text-[11px] text-workshop-muted">Notizen: {workflow.config.notes}</p>
-              )}
+            );
+          })}
+          {configs.length === 0 && !isLoading && (
+            <p className="text-[10px] text-workshop-muted">Noch keine Einträge.</p>
+          )}
+        </div>
+      </aside>
+
+      {/* Hauptbereich: Entwurf */}
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-y-auto">
+        {isLoading && <p className="text-xs text-workshop-muted">Lade Workflow…</p>}
+
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-xs text-workshop-muted">
+            Entwurf auf Basis von{" "}
+            <span className="font-semibold text-workshop-text">{activeName ?? "—"}</span>
+            {dirty ? " · ungespeicherte Änderungen" : ""}
+            {isStandardActive ? " · Standard unveränderlich in der DB" : ""}
+          </div>
+        </div>
+
+        {Object.keys(draftAgents).length > 0 && (
+          <>
+            <WorkflowDiagram edges={workflow?.edges ?? []} enabledAgents={draftEnabled} />
+
+            <div className="rounded-md border border-workshop-border bg-workshop-bg/40 p-3 text-xs">
+              <div className="mb-2 text-[10px] font-mono uppercase text-workshop-muted">Laufzeit</div>
+              <div className="flex flex-wrap gap-3">
+                <label className="flex flex-col gap-1">
+                  <span className="text-workshop-muted">max_iterations</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={draftMaxIter}
+                    onChange={(e) => {
+                      setDraftMaxIter(Number(e.target.value));
+                      markDirty();
+                    }}
+                    className="w-24 rounded border border-workshop-border bg-workshop-bg px-2 py-1"
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-workshop-muted">sandbox_timeout (s)</span>
+                  <input
+                    type="number"
+                    min={5}
+                    max={300}
+                    value={draftTimeout}
+                    onChange={(e) => {
+                      setDraftTimeout(Number(e.target.value));
+                      markDirty();
+                    }}
+                    className="w-24 rounded border border-workshop-border bg-workshop-bg px-2 py-1"
+                  />
+                </label>
+              </div>
             </div>
-            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
               {orderedIds.map((id) => (
-                <AgentCard
-                  key={id}
-                  id={id}
-                  agent={agents[id]}
-                  selected={id === selectedAgentId}
-                  onSelect={() => setSelectedAgentId(id)}
-                />
+                <div key={id} className="space-y-1">
+                  <AgentCard
+                    id={id}
+                    agent={draftAgents[id]}
+                    selected={id === selectedAgentId}
+                    enabled={draftEnabled.includes(id)}
+                    fixed={FIXED.has(id)}
+                    onSelect={() => setSelectedAgentId(id)}
+                  />
+                  {!FIXED.has(id) && (
+                    <button
+                      type="button"
+                      onClick={() => toggleAgent(id)}
+                      className="w-full rounded border border-workshop-border px-2 py-1 text-[10px] text-workshop-muted hover:text-workshop-text"
+                    >
+                      {draftEnabled.includes(id) ? "Deaktivieren" : "Aktivieren"}
+                    </button>
+                  )}
+                </div>
               ))}
             </div>
-            {selectedAgent && <AgentDetail id={selectedAgentId} agent={selectedAgent} />}
+
+            {selectedAgent && (
+              <div className="space-y-2 rounded-md border border-workshop-border bg-workshop-bg/50 p-3 text-xs">
+                <div className="font-semibold text-workshop-text">{selectedAgent.display_name}</div>
+                <p className="text-workshop-muted">{selectedAgent.role}</p>
+                <div className="font-mono text-[10px] text-workshop-muted">{selectedAgentId}</div>
+                <div>
+                  <div className="mb-1 text-[10px] font-mono uppercase text-workshop-muted">Guidance</div>
+                  <textarea
+                    value={draftGuidance}
+                    onChange={(e) => {
+                      setDraftGuidance(e.target.value);
+                      markDirty();
+                    }}
+                    rows={4}
+                    className="w-full resize-y rounded border border-workshop-border bg-black/30 p-2 text-[11px] text-workshop-text"
+                  />
+                  <button
+                    type="button"
+                    onClick={applyGuidanceToDraft}
+                    className="mt-2 rounded-md border border-workshop-border px-3 py-1.5 text-[11px] text-workshop-text"
+                  >
+                    Guidance in Entwurf übernehmen
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <form
+              onSubmit={handleSave}
+              className="sticky bottom-0 flex flex-wrap items-end gap-2 rounded-md border border-workshop-border bg-workshop-panel p-3"
+            >
+              <label className="min-w-[12rem] flex-1">
+                <span className="mb-1 block text-[10px] font-mono uppercase text-workshop-muted">
+                  Speichern unter Name
+                </span>
+                <input
+                  value={saveName}
+                  onChange={(e) => setSaveName(e.target.value)}
+                  placeholder={isStandardActive ? "z. B. Mein Workflow" : "Name der Konfiguration"}
+                  className="w-full rounded-md border border-workshop-border bg-workshop-bg px-2 py-1.5 text-xs"
+                />
+              </label>
+              <button
+                type="submit"
+                disabled={busy || !saveName.trim()}
+                className="rounded-md bg-workshop-accent px-4 py-2 text-xs font-semibold text-workshop-bg disabled:opacity-40"
+              >
+                Speichern
+              </button>
+              <p className="basis-full text-[10px] text-workshop-muted">
+                Änderungen zuerst im Entwurf, dann speichern. Nur der Supervisor ist immer fix; Flexible,
+                Inventory und die Leer-Agenten sind optional. Leer-Agenten 1/2 sind in Standard aus und
+                wirken nur über Guidance. „Standard“ kann nicht gelöscht werden.
+              </p>
+            </form>
           </>
         )}
-      </div>
 
-      {/* Rechts: Meta-Coach Chat */}
-      <div className="flex min-h-0 flex-col gap-2 rounded-md border border-workshop-border bg-workshop-panel/50 p-3">
-        <div className="flex items-start justify-between gap-2">
-          <div>
-            <div className="text-sm font-semibold text-workshop-text">Meta-Coach</div>
-            <p className="text-[11px] text-workshop-muted">
-              Analysiert Logging-Files und passt Agent-Eigenschaften / Workflow mit dir gemeinsam an.
-            </p>
-          </div>
-        </div>
-
-        {logs.length > 0 && (
-          <div className="max-h-24 space-y-1 overflow-y-auto rounded border border-workshop-border/60 p-2">
-            <div className="text-[10px] font-mono uppercase text-workshop-muted">Logs einbeziehen (optional)</div>
-            {logs.slice(0, 12).map((log) => {
-              const checked = selectedLogs.includes(log.name);
-              return (
-                <label key={log.name} className="flex cursor-pointer items-center gap-2 text-[11px]">
-                  <input type="checkbox" checked={checked} onChange={() => toggleLog(log.name)} />
-                  <span className="truncate text-workshop-text" title={log.name}>
-                    {log.name}
-                  </span>
-                  {log.processed && <span className="text-workshop-muted">processed</span>}
-                </label>
-              );
-            })}
-          </div>
-        )}
-
-        <div
-          ref={chatScrollRef}
-          className="min-h-0 flex-1 space-y-2 overflow-y-auto rounded-md border border-workshop-border bg-black/20 p-3"
-        >
-          {messages.length === 0 && (
-            <p className="text-xs text-workshop-muted">
-              z.&nbsp;B. „Analysiere die letzten Logs und schlage Guidance für den 3D Builder vor“ oder „Erhöhe
-              max_iterations auf 8 und erkläre warum“.
-            </p>
-          )}
-          {messages.map((m, idx) => (
-            <div
-              key={`${m.role}-${idx}`}
-              className={
-                m.role === "user"
-                  ? "ml-6 rounded-lg bg-workshop-accent/15 px-3 py-2 text-sm text-workshop-text"
-                  : "mr-4 rounded-lg border border-workshop-border bg-workshop-bg px-3 py-2 text-xs text-workshop-text whitespace-pre-wrap"
-              }
-            >
-              {m.content}
-            </div>
-          ))}
-          {chatMutation.isPending && (
-            <div className="text-xs text-workshop-muted">Meta-Coach analysiert…</div>
-          )}
-        </div>
-
-        <form onSubmit={(e) => void handleSend(e)} className="flex flex-col gap-2">
-          <textarea
-            rows={3}
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            placeholder="Frage oder Optimierungsauftrag an den Meta-Coach…"
-            disabled={chatMutation.isPending}
-            className="resize-none rounded-md border border-workshop-border bg-workshop-bg p-2 text-sm focus:border-workshop-accent focus:outline-none disabled:opacity-60"
-          />
-          <div className="flex justify-end">
-            <button
-              type="submit"
-              disabled={chatMutation.isPending || draft.trim().length < 2}
-              className="rounded-md bg-workshop-accent px-4 py-2 text-sm font-semibold text-workshop-bg disabled:opacity-40"
-            >
-              {chatMutation.isPending ? "…" : "Senden"}
-            </button>
-          </div>
-        </form>
+        {statusMsg && <p className="text-xs text-workshop-success">{statusMsg}</p>}
+        {errorMsg && <p className="text-xs text-workshop-danger">{errorMsg}</p>}
       </div>
     </div>
   );

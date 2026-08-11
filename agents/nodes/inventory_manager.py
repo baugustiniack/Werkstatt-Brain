@@ -115,12 +115,13 @@ def _keywords_from_part(part: dict) -> list[str]:
 
 
 def _asset_description(asset: UnprocessedAsset) -> str:
-    if asset.notes and asset.notes.strip():
-        return asset.notes.strip()
+    from app.services.inventory_notes import combined_description
+
     vision = asset.vision_result or {}
+    vision_fallback = None
     if isinstance(vision, dict) and vision.get("description"):
-        return str(vision["description"]).strip()
-    return ""
+        vision_fallback = str(vision["description"]).strip()
+    return combined_description(asset, vision_fallback=vision_fallback)
 
 
 def _fetch_relevant_assets(
@@ -166,6 +167,8 @@ def _fetch_relevant_assets(
                 base.where(
                     or_(
                         UnprocessedAsset.notes.ilike(f"%{conversation_id}%"),
+                        UnprocessedAsset.ai_notes.ilike(f"%{conversation_id}%"),
+                        UnprocessedAsset.user_notes.ilike(f"%{conversation_id}%"),
                         cast(UnprocessedAsset.tags, String).ilike(f"%{conv_tag}%"),
                         cast(UnprocessedAsset.tags, String).ilike("%generated_3d%"),
                     )
@@ -175,7 +178,10 @@ def _fetch_relevant_assets(
             exact = [
                 a
                 for a in chat_rows
-                if conv_tag in (a.tags or []) or (conversation_id in (a.notes or ""))
+                if conv_tag in (a.tags or [])
+                or (conversation_id in (a.notes or ""))
+                or (conversation_id in (a.ai_notes or ""))
+                or (conversation_id in (a.user_notes or ""))
             ]
             _add(exact)
             if len(assets) < limit:
@@ -190,8 +196,18 @@ def _fetch_relevant_assets(
             like = f"%{kw}%"
             filters.append(UnprocessedAsset.title.ilike(like))
             filters.append(UnprocessedAsset.notes.ilike(like))
+            filters.append(UnprocessedAsset.ai_notes.ilike(like))
+            filters.append(UnprocessedAsset.user_notes.ilike(like))
         matched = db.execute(
-            base.where(UnprocessedAsset.notes.isnot(None)).where(or_(*filters)).limit(limit)
+            base.where(
+                or_(
+                    UnprocessedAsset.notes.isnot(None),
+                    UnprocessedAsset.ai_notes.isnot(None),
+                    UnprocessedAsset.user_notes.isnot(None),
+                )
+            )
+            .where(or_(*filters))
+            .limit(limit)
         ).scalars().all()
         _add(matched)
 
@@ -203,6 +219,8 @@ def _fetch_relevant_assets(
             base.where(
                 or_(
                     UnprocessedAsset.notes.isnot(None),
+                    UnprocessedAsset.ai_notes.isnot(None),
+                    UnprocessedAsset.user_notes.isnot(None),
                     cast(UnprocessedAsset.tags, String).ilike("%KI-Generiert%"),
                 )
             ).limit(limit)
@@ -245,12 +263,110 @@ def inventory_manager_node(state: AgentState) -> AgentState:
     part_label = f"Teil {idx + 1}/{len(parts)} ('{part.get('name', 'Unbenannt')}')"
     constraints = part.get("material_tool_constraints", {})
     conversation_id = state.get("conversation_id")
+    keywords = _keywords_from_part(part)
+
+    # Knowledge Graph: gelernte Assoziationen (parallel zum Direkt-DB-Zugriff)
+    kg_result: dict = {"hits": [], "summary": "KG nicht abgefragt", "stats": {}}
+    try:
+        from app.services.inventory_knowledge_graph import (
+            InventoryKnowledgeGraph,
+            query_knowledge_graph,
+        )
+
+        kg = InventoryKnowledgeGraph.load()
+        if not kg.nodes:
+            # Erstes Mal / leer → einmalig aus DB anlernen
+            train_stats = kg.rebuild_from_db()
+            logger.info("Inventory KG auto-train: %s", train_stats)
+        kg_result = query_knowledge_graph(
+            keywords=keywords,
+            material_type=constraints.get("material_type"),
+            tool_diameter_mm=constraints.get("tool_diameter_mm"),
+            limit=10,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Knowledge-Graph-Abfrage fehlgeschlagen: %s", exc)
 
     db = SessionLocal()
     try:
         tool_match = _find_matching_tool(db, constraints.get("tool_diameter_mm"))
         stock_match = _find_matching_stock(db, constraints.get("material_type"), constraints.get("plate_thickness_mm"))
         relevant_assets = _fetch_relevant_assets(db, part, conversation_id=conversation_id)
+
+        # KG-Hinweise können DB-Treffer ergänzen / priorisieren
+        kg_tool_hints = [
+            h for h in (kg_result.get("hits") or [])
+            if (h.get("node") or {}).get("type") == "tool"
+        ]
+        kg_asset_hints = [
+            h for h in (kg_result.get("hits") or [])
+            if (h.get("node") or {}).get("type") == "asset"
+        ]
+        if tool_match is None and kg_tool_hints:
+            hint = kg_tool_hints[0]["node"]
+            props = hint.get("props") or {}
+            # Direkt-DB nachladen falls ID bekannt
+            hint_id = str(hint.get("id") or "").removeprefix("tool:")
+            if hint_id:
+                from uuid import UUID
+
+                try:
+                    row = db.get(Tool, UUID(hint_id))
+                    if row and row.status != ToolStatus.ABGEBROCHEN:
+                        tool_match = {
+                            "id": str(row.id),
+                            "name": row.name,
+                            "diameter_mm": float(row.diameter_mm),
+                            "max_rpm": row.max_rpm,
+                            "exact_match": False,
+                            "from_knowledge_graph": True,
+                        }
+                except Exception:  # noqa: BLE001
+                    tool_match = {
+                        "id": hint_id,
+                        "name": hint.get("label"),
+                        "diameter_mm": props.get("diameter_mm"),
+                        "max_rpm": props.get("max_rpm"),
+                        "exact_match": False,
+                        "from_knowledge_graph": True,
+                    }
+        # Asset-IDs aus KG, die noch nicht in relevant_assets sind, nachladen
+        have_ids = {a.get("id") for a in relevant_assets}
+        for hint in kg_asset_hints:
+            aid = str((hint.get("node") or {}).get("id") or "").removeprefix("asset:")
+            if not aid or aid in have_ids:
+                continue
+            from uuid import UUID
+
+            try:
+                asset = db.get(UnprocessedAsset, UUID(aid))
+            except Exception:  # noqa: BLE001
+                asset = None
+            if asset is None:
+                continue
+            description = _asset_description(asset)
+            if not description:
+                description = asset.title or asset.file_path or aid
+            relevant_assets.append(
+                {
+                    "id": str(asset.id),
+                    "title": asset.title or asset.file_path,
+                    "file_type": asset.file_type.value if asset.file_type else None,
+                    "file_path": asset.file_path,
+                    "category": (asset.vision_result or {}).get("category")
+                    if isinstance(asset.vision_result, dict)
+                    else None,
+                    "tags": asset.tags or [],
+                    "description": truncate(description, 2000),
+                    "from_chat": "from_chat" in (asset.tags or []),
+                    "ai_generated": "KI-Generiert" in (asset.tags or []),
+                    "from_knowledge_graph": True,
+                    "kg_score": hint.get("score"),
+                }
+            )
+            have_ids.add(aid)
+            if len(relevant_assets) >= 10:
+                break
     finally:
         db.close()
 
@@ -289,11 +405,32 @@ def inventory_manager_node(state: AgentState) -> AgentState:
             f"{len(relevant_assets)} Referenz-Asset(s) aus der Inventar-Bibliothek für den 3D-Builder geladen."
         )
 
+    kg_hits = kg_result.get("hits") or []
+    if kg_hits:
+        gap_analysis.append(
+            f"Knowledge Graph: {len(kg_hits)} Assoziation(en) – {kg_result.get('summary') or ''}"
+        )
+
     updated_part["gap_analysis"] = gap_analysis
     if idx < len(parts):
         parts[idx] = updated_part
     updated_contract = dict(contract)
     updated_contract["parts"] = parts
+
+    # Lernen: Match-Assoziationen im Graph verstärken
+    learn_stats: dict = {}
+    try:
+        if tool_match or stock_match or relevant_assets:
+            from app.services.inventory_knowledge_graph import learn_inventory_match
+
+            learn_stats = learn_inventory_match(
+                tool=tool_match,
+                stock=stock_match,
+                assets=relevant_assets,
+                part=part,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("KG-Lernen fehlgeschlagen: %s", exc)
 
     context = {
         "sender_agent": "Inventory_Manager",
@@ -304,6 +441,13 @@ def inventory_manager_node(state: AgentState) -> AgentState:
             "stock_constraints": stock_match or {},
             "relevant_rules": relevant_rules,
             "relevant_assets": relevant_assets,
+            "knowledge_graph": {
+                "summary": kg_result.get("summary"),
+                "hits": kg_hits[:8],
+                "seed_nodes": kg_result.get("seed_nodes") or [],
+                "stats": kg_result.get("stats") or {},
+                "learned_this_run": learn_stats,
+            },
         },
     }
 
@@ -315,8 +459,9 @@ def inventory_manager_node(state: AgentState) -> AgentState:
             {
                 "role": "assistant",
                 "content": (
-                    f"[Inventory Manager] {part_label}: Werkzeug/Material abgeglichen. "
-                    f"Regeln: {len(relevant_rules)}, Referenz-Assets: {len(relevant_assets)}."
+                    f"[Inventory Manager] {part_label}: Werkzeug/Material abgeglichen "
+                    f"(DB + Knowledge Graph). Regeln: {len(relevant_rules)}, "
+                    f"Assets: {len(relevant_assets)}, KG-Hits: {len(kg_hits)}."
                 ),
             }
         ],
@@ -324,7 +469,7 @@ def inventory_manager_node(state: AgentState) -> AgentState:
             make_entry(
                 "inventory_manager",
                 "context_injection",
-                f"{part_label}: Inventar + {len(relevant_assets)} Asset-Beschreibung(en) → 3D Builder",
+                f"{part_label}: Inventar + KG ({len(kg_hits)} Hits) → 3D Builder",
                 detail={
                     "part_label": part_label,
                     "tool_match": tool_match,
@@ -334,6 +479,9 @@ def inventory_manager_node(state: AgentState) -> AgentState:
                     "asset_titles": [a.get("title") for a in relevant_assets],
                     "conversation_id": conversation_id,
                     "chat_linked_assets": sum(1 for a in relevant_assets if a.get("from_chat")),
+                    "kg_summary": kg_result.get("summary"),
+                    "kg_hits_count": len(kg_hits),
+                    "kg_learn": learn_stats,
                     "escalation_reasons": escalation_reasons,
                 },
                 to_agent="builder_3d",

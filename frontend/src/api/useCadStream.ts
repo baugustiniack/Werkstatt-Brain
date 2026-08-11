@@ -11,6 +11,7 @@ import type {
   EscalationPayload,
   RequirementsContract,
 } from "./types";
+import { useWorkflowWakeLock } from "../hooks/useWorkflowWakeLock";
 
 export type CadRunStatus =
   | "idle"
@@ -75,6 +76,8 @@ export function useCadStream(): UseCadStreamResult {
   const socketRef = useRef<WebSocket | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const pausedSessionIdRef = useRef<string | null>(null);
+
+  useWorkflowWakeLock(status === "connecting" || status === "running" || status === "escalation");
 
   const clearRun = useCallback(() => {
     const prevSocket = socketRef.current;

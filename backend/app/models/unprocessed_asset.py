@@ -62,7 +62,12 @@ class UnprocessedAsset(Base):
         server_default=AssetSource.CRAWLER.value,
     )
     title: Mapped[str | None] = mapped_column(String(255))
+    # Legacy/Suchfeld: gespiegelt aus ai_notes (Kompatibilität für ältere Clients/Queries)
     notes: Mapped[str | None] = mapped_column(Text)
+    # Nutzer-Beschreibung (manuell); fließt in die KI-Generierung ein, wird von der KI nicht überschrieben
+    user_notes: Mapped[str | None] = mapped_column(Text)
+    # KI-Beschreibung (Vision/LLM); User kann sie optional nachbearbeiten
+    ai_notes: Mapped[str | None] = mapped_column(Text)
     tags: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list, server_default="[]")
     vision_result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     error_message: Mapped[str | None] = mapped_column(Text)

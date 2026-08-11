@@ -5,6 +5,7 @@ from langgraph.graph import END, START, StateGraph
 
 from agents.nodes.builder_3d import builder_3d_node
 from agents.nodes.concept_builder import concept_builder_node
+from agents.nodes.empty_agent import custom_agent_1_node, custom_agent_2_node
 from agents.nodes.fertigung_specialist import fertigung_specialist_node
 from agents.nodes.flexible_specialist import flexible_specialist_node
 from agents.nodes.human_escalation import human_escalation_node
@@ -17,6 +18,8 @@ from agents.state import AgentState
 
 _SUPERVISOR_ROUTE_MAP = {
     "flexible_specialist": "flexible_specialist",
+    "custom_agent_1": "custom_agent_1",
+    "custom_agent_2": "custom_agent_2",
     "vv_manager": "vv_manager",
     "concept_builder": "concept_builder",
     "inventory_manager": "inventory_manager",
@@ -30,11 +33,13 @@ _SUPERVISOR_ROUTE_MAP = {
 
 
 def create_agent_graph():
-    """Hub-and-Spoke inkl. Montage Manager nach Abschluss aller Teile."""
+    """Hub-and-Spoke inkl. optionaler Leer-Agenten."""
     graph = StateGraph(AgentState)
 
     graph.add_node("supervisor", supervisor_node)
     graph.add_node("flexible_specialist", flexible_specialist_node)
+    graph.add_node("custom_agent_1", custom_agent_1_node)
+    graph.add_node("custom_agent_2", custom_agent_2_node)
     graph.add_node("vv_manager", vv_manager_node)
     graph.add_node("concept_builder", concept_builder_node)
     graph.add_node("inventory_manager", inventory_manager_node)
@@ -46,6 +51,8 @@ def create_agent_graph():
 
     graph.add_edge(START, "supervisor")
     graph.add_edge("flexible_specialist", "supervisor")
+    graph.add_edge("custom_agent_1", "supervisor")
+    graph.add_edge("custom_agent_2", "supervisor")
     graph.add_edge("vv_manager", "supervisor")
     graph.add_edge("concept_builder", "supervisor")
     graph.add_edge("inventory_manager", "supervisor")

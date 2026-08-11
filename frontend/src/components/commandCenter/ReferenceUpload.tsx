@@ -21,7 +21,11 @@ function itemLabel(item: InventoryItem): string {
 }
 
 function itemDescription(item: InventoryItem): string {
-  if (item.notes?.trim()) return item.notes.trim();
+  const user = (item.user_notes ?? "").trim();
+  const ai = (item.ai_notes ?? item.notes ?? "").trim();
+  if (user && ai) return `Nutzer: ${user}\n\nKI: ${ai}`;
+  if (user) return user;
+  if (ai) return ai;
   const vision = item.vision_result;
   if (vision && typeof vision.description === "string" && vision.description.trim()) {
     return vision.description.trim();

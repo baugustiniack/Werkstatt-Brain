@@ -30,6 +30,9 @@ def verify_postgres_connection() -> None:
 
 
 def init_db() -> None:
+    # Modelle registrieren (create_all)
+    from app.models import agent_workflow_config as _aw  # noqa: F401
+
     Base.metadata.create_all(bind=engine)
     # Additive Schema-Updates ohne Alembic (bestehende DBs)
     with engine.begin() as connection:
@@ -39,4 +42,30 @@ def init_db() -> None:
                 "ADD COLUMN IF NOT EXISTS meta JSONB"
             )
         )
+        connection.execute(
+            text(
+                "ALTER TABLE unprocessed_assets "
+                "ADD COLUMN IF NOT EXISTS user_notes TEXT"
+            )
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE unprocessed_assets "
+                "ADD COLUMN IF NOT EXISTS ai_notes TEXT"
+            )
+        )
+        # Bestehende notes → ai_notes (einmalig, nur wenn ai_notes noch leer)
+        connection.execute(
+            text(
+                "UPDATE unprocessed_assets "
+                "SET ai_notes = notes "
+                "WHERE ai_notes IS NULL AND notes IS NOT NULL AND BTRIM(notes) <> ''"
+            )
+        )
+    try:
+        from app.services.agent_workflow_db import ensure_standard_workflow
+
+        ensure_standard_workflow()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Standard-Workflow konnte nicht geseedet werden: %s", exc)
     logger.info("PostgreSQL schema bereit (create_all + additive Alters)")

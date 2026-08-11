@@ -27,6 +27,12 @@ from app.models.stock_material import StockMaterial
 from app.models.tool import Tool, ToolStatus
 from app.models.unprocessed_asset import UnprocessedAsset
 from app.services import settings_store
+from app.services.inventory_notes import (
+    effective_ai_notes,
+    effective_user_notes,
+    notes_blob,
+    set_ai_notes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,8 @@ WICHTIG:
 - Ein hölzerner Schrank / Eckschrank / Möbelstück im Raum ist IMMER "product_concept", NIEMALS "material".
 - "material" nur, wenn das Motiv klar Rohware/Lagerbestand ist (nicht das fertige Produkt).
 - Das Feld "description" ist PFLICHT und darf NIE leer sein (mindestens 3–6 Sätze auf Deutsch).
+- Wenn eine Nutzer-Beschreibung mitgeliefert wird: inhaltlich einbeziehen und ergänzen \
+(nicht ignorieren, nicht wortgleich kopieren; Widersprüche klar benennen).
 - Beschreibe sichtbar: Motiv, Bildtyp (Foto/Scan/Screenshot/KI-Render/Zeichnung), Farben, Materialien, Maße falls erkennbar, \
 Werkstatt-Relevanz.
 - Bei Personenfotos: KEINE Identifikation/Namen. Beschreibe nur Bildausschnitt, Umgebung, Kleidung/Kontext \
@@ -139,6 +147,7 @@ def _call_openai_vision(
     media_type: str,
     *,
     hint: str | None = None,
+    user_notes: str | None = None,
 ) -> dict[str, Any]:
     import base64
 
@@ -153,6 +162,12 @@ def _call_openai_vision(
     data_url = f"data:{media_type};base64,{encoded}"
     model = settings.openai_vision_model or "gpt-4o-mini"
     hint_text = f"\nZusatzhinweis zur Klassifizierung: {hint}" if hint else ""
+    user_text = ""
+    if user_notes and user_notes.strip():
+        user_text = (
+            f"\n\nNutzer-Beschreibung (MUSS in die KI-Beschreibung einbezogen werden):\n"
+            f"{user_notes.strip()}"
+        )
 
     response = client.chat.completions.create(
         model=model,
@@ -168,7 +183,7 @@ def _call_openai_vision(
                         "text": (
                             "Analysiere dieses Inventar-Bild und liefere das JSON. "
                             "description muss ausführlich und nicht leer sein."
-                            f"{hint_text}"
+                            f"{hint_text}{user_text}"
                         ),
                     },
                     {"type": "image_url", "image_url": {"url": data_url}},
@@ -233,7 +248,7 @@ def _asset_forces_cad_model(asset: UnprocessedAsset) -> bool:
         "KI-Generiert" in tags or "from_chat" in tags
     ):
         return True
-    notes = (asset.notes or "").lower()
+    notes = notes_blob(asset).lower()
     if "ki-generiertes 3d-modell" in notes or "generated_3d" in notes:
         return True
     return False
@@ -252,7 +267,7 @@ def _asset_forces_product_concept(asset: UnprocessedAsset) -> bool:
     title = (asset.title or "").lower()
     if "_concept_" in path or path.endswith("_concept.png") or "konzept" in title:
         return True
-    notes = (asset.notes or "").lower()
+    notes = notes_blob(asset).lower()
     if "konzept-foto aus cad-session" in notes:
         return True
     return False
@@ -386,6 +401,7 @@ def analyze_asset_image(
     file_path: str,
     *,
     classification_hint: str | None = None,
+    user_notes: str | None = None,
 ) -> VisionIngestResult:
     """Analysiert ein Bild ausschließlich per OpenAI Vision."""
     path = Path(file_path)
@@ -398,7 +414,12 @@ def analyze_asset_image(
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            raw_result = _call_openai_vision(image_bytes, media_type, hint=classification_hint)
+            raw_result = _call_openai_vision(
+                image_bytes,
+                media_type,
+                hint=classification_hint,
+                user_notes=user_notes,
+            )
             return VisionIngestResult(**raw_result)
         except Exception as exc:  # noqa: BLE001
             last_error = exc
@@ -428,7 +449,7 @@ def asset_needs_ai_rescan(asset: UnprocessedAsset) -> bool:
     tags = asset.tags or []
     if "heuristic_fallback" in tags or "cad_raw" in tags:
         return True
-    notes = (asset.notes or "").lower()
+    notes = notes_blob(asset).lower()
     stubs = (
         "kein vision-modell konfiguriert",
         "rohe cad-datei ohne vision",
@@ -446,8 +467,8 @@ def asset_needs_ai_rescan(asset: UnprocessedAsset) -> bool:
 
 
 _MANUAL_ENTRY_SYSTEM_PROMPT = """Du bist ein Experte für Werkstatt-Inventar (CNC-Fräser, Holz-/Materiallager, Produktkonzepte).
-Ein Nutzer hat einen manuellen Inventar-Eintrag ohne Datei angelegt (nur Titel/Notiz). \
-Analysiere Titel und Notiz und antworte AUSSCHLIESSLICH mit einem einzelnen JSON-Objekt (keine Erklärungen, \
+Ein Nutzer hat einen manuellen Inventar-Eintrag ohne Datei angelegt (Titel + optionale Nutzer-Beschreibung). \
+Analysiere Titel und Nutzer-Beschreibung und antworte AUSSCHLIESSLICH mit einem einzelnen JSON-Objekt (keine Erklärungen, \
 kein Markdown) exakt in diesem Format:
 {
   "category": "tool" | "material" | "product_concept" | "reference_photo" | "cad_reference" | "document" | "unknown",
@@ -459,6 +480,7 @@ kein Markdown) exakt in diesem Format:
   "tags": [string, ...]
 }
 Fertige Möbel/Projekte → product_concept. Rohware → material. Werkzeuge → tool.
+Die Nutzer-Beschreibung MUSS in "description" einbezogen und sinnvoll ergänzt werden (nicht ignorieren).
 Lasse nicht anwendbare Felder in estimated_dimensions einfach weg."""
 
 
@@ -506,13 +528,13 @@ def _heuristic_fallback_text(title: str, notes: str) -> dict[str, Any]:
 
 
 def analyze_manual_entry(title: str, notes: str) -> VisionIngestResult:
-    """Strukturiert einen manuellen Inventar-Eintrag (Titel/Notiz, kein Anhang)
-    per Text-LLM-Call (Nutzer-Feedback: unstrukturierte Einträge, KI-Strukturierung
-    auf Wunsch/im Hintergrund)."""
+    """Strukturiert einen manuellen Inventar-Eintrag (Titel + Nutzer-Beschreibung)
+    per Text-LLM-Call. Die Nutzer-Beschreibung fließt in die KI-Beschreibung ein."""
     if settings_store.is_anthropic_configured():
         try:
             raw_result = _call_anthropic_text(
-                _MANUAL_ENTRY_SYSTEM_PROMPT, f"Titel: {title}\nNotiz: {notes or '(keine)'}"
+                _MANUAL_ENTRY_SYSTEM_PROMPT,
+                f"Titel: {title}\nNutzer-Beschreibung: {notes or '(keine)'}",
             )
             raw_result["category"] = _normalize_category(raw_result.get("category"))
             return VisionIngestResult(**raw_result)
@@ -615,6 +637,7 @@ Anforderungen an "description":
 - 2–6 Absätze bzw. strukturierte Aufzählung
 - Was ist die Datei? Wofür ist sie in der Werkstatt relevant?
 - Maße, Materialien, Hinweise zur Fertigung, wenn erkennbar
+- Wenn eine Nutzer-Beschreibung vorliegt: inhaltlich einbeziehen und ergänzen
 - Lücken/Unsicherheiten klar benennen
 Lasse nicht anwendbare Felder in estimated_dimensions einfach weg."""
 
@@ -633,7 +656,7 @@ def analyze_document_file(
     context = extract_file_context(path, file_type)
     user_prompt = (
         f"Titel: {title or path.name}\n"
-        f"Vorhandene Nutzer-Notiz: {existing_notes or '(keine)'}\n\n"
+        f"Nutzer-Beschreibung (einbeziehen!): {existing_notes or '(keine)'}\n\n"
         f"{context}\n\n"
         "Erstelle die umfassende JSON-Beschreibung."
     )
@@ -673,7 +696,7 @@ def repair_misclassified_asset(db: Session, asset: UnprocessedAsset) -> bool:
     z.B. KI-Konzeptbild fälschlich als material → product_concept + KI-Generiert."""
     vision = asset.vision_result if isinstance(asset.vision_result, dict) else {}
     category = str(vision.get("category") or "")
-    desc = f"{asset.notes or ''} {vision.get('description') or ''} {asset.title or ''}".lower()
+    desc = f"{notes_blob(asset)} {vision.get('description') or ''} {asset.title or ''}".lower()
     furniture_hints = (
         "schrank",
         "eckschrank",
@@ -708,12 +731,14 @@ def repair_misclassified_asset(db: Session, asset: UnprocessedAsset) -> bool:
 def ingest_asset(db: Session, asset: UnprocessedAsset) -> dict[str, Any]:
     """Orchestriert die vollständige Ingestion eines `unprocessed_assets`-Eintrags:
     Vision-/Text-Analyse (je nach Typ) -> DB-/Qdrant-Routing -> Status-Update.
-    Die KI-Beschreibung wird in `notes` geschrieben (vom User editierbar)."""
+    Die KI-Beschreibung landet in `ai_notes` (User-Text in `user_notes` bleibt erhalten
+    und wird bei der Generierung einbezogen)."""
     from app.models.unprocessed_asset import AssetFileType, AssetStatus
 
+    user_desc = effective_user_notes(asset) or ""
     try:
         if asset.file_type == AssetFileType.MANUAL or not asset.file_path:
-            result = analyze_manual_entry(asset.title or "Unbenannter Eintrag", asset.notes or "")
+            result = analyze_manual_entry(asset.title or "Unbenannter Eintrag", user_desc)
         elif asset.file_type == AssetFileType.IMAGE:
             hint = None
             if _asset_forces_product_concept(asset):
@@ -722,12 +747,16 @@ def ingest_asset(db: Session, asset: UnprocessedAsset) -> dict[str, Any]:
                     "category MUSS 'product_concept' sein (nicht material/tool). "
                     "Tag 'KI-Generiert' setzen."
                 )
-            result = analyze_asset_image(asset.file_path, classification_hint=hint)
+            result = analyze_asset_image(
+                asset.file_path,
+                classification_hint=hint,
+                user_notes=user_desc or None,
+            )
         else:
-            hint_notes = asset.notes
+            hint_notes = user_desc
             if _asset_forces_cad_model(asset):
                 hint_notes = (
-                    (asset.notes or "")
+                    (user_desc or "")
                     + "\n\nDies ist ein KI-generiertes 3D-Modell (STEP/STL) aus dem CAD-Chat. "
                     "category MUSS 'cad_reference' sein. Tags: KI-Generiert, generated_3d."
                 ).strip()
@@ -735,7 +764,7 @@ def ingest_asset(db: Session, asset: UnprocessedAsset) -> dict[str, Any]:
                 asset.file_path,
                 file_type=asset.file_type.value,
                 title=asset.title,
-                existing_notes=hint_notes,
+                existing_notes=hint_notes or None,
             )
 
         result = _apply_result_guards(asset, result)
@@ -754,7 +783,9 @@ def ingest_asset(db: Session, asset: UnprocessedAsset) -> dict[str, Any]:
 
         asset.vision_result = result.model_dump()
         if result.description.strip():
-            asset.notes = _merge_notes(asset.notes, result.description)
+            # Metadaten-Zeilen aus bisheriger KI-/Legacy-Notiz behalten; User-Text unangetastet
+            existing_ai = effective_ai_notes(asset)
+            set_ai_notes(asset, _merge_notes(existing_ai, result.description))
         asset.tags = _preserve_protected_tags(asset.tags, result.tags)
         # Konzept-Assets: Tags und Kategorie hart sichern
         if _asset_forces_product_concept(asset) or result.category == "product_concept":

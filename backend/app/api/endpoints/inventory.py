@@ -28,7 +28,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -62,7 +62,17 @@ class AssetUploadResponse(BaseModel):
     created_record: dict[str, Any] | None = None
 
 
-def _persist_upload_and_ingest(filename: str, content: bytes, title: str | None) -> AssetUploadResponse:
+def _persist_upload(
+    filename: str,
+    content: bytes,
+    title: str | None,
+    *,
+    user_notes: str | None = None,
+    mobile: bool = False,
+) -> AssetUploadResponse:
+    """Speichert Datei + DB-Eintrag sofort (ohne Vision) – wichtig für Handy-Uploads."""
+    from app.services.inventory_notes import set_user_notes
+
     upload_dir = Path(settings.uploads_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
 
@@ -71,22 +81,31 @@ def _persist_upload_and_ingest(filename: str, content: bytes, title: str | None)
     dest_path.write_bytes(content)
 
     asset_type = crawler.classify_file_type(dest_path)
+    # iPhone liefert oft image.jpg ohne Endung oder HEIC – per Content trotzdem als Bild
+    if asset_type == AssetFileType.OTHER and (
+        filename.lower().endswith((".heic", ".heif", ".jpg", ".jpeg", ".png", ".webp"))
+        or (len(content) > 12 and content[:3] == b"\xff\xd8\xff")  # JPEG SOI
+        or content[:8] == b"\x89PNG\r\n\x1a\n"
+    ):
+        asset_type = AssetFileType.IMAGE
+
     file_hash = crawler.compute_file_hash(dest_path)
 
     db = SessionLocal()
     try:
         existing = db.query(UnprocessedAsset).filter(UnprocessedAsset.file_hash == file_hash).one_or_none()
         if existing is not None:
-            dest_path.unlink(missing_ok=True)  # Duplikat – frisch geschriebene Kopie wieder entfernen
+            dest_path.unlink(missing_ok=True)
             return AssetUploadResponse(
                 asset_id=str(existing.id),
-                file_path=existing.file_path,
+                file_path=existing.file_path or "",
                 file_type=existing.file_type.value,
                 status=existing.status.value,
                 duplicate=True,
                 vision_result=existing.vision_result,
             )
 
+        tags = ["mobile_upload"] if mobile else []
         asset = UnprocessedAsset(
             file_path=str(dest_path),
             file_hash=file_hash,
@@ -94,16 +113,61 @@ def _persist_upload_and_ingest(filename: str, content: bytes, title: str | None)
             source=AssetSource.UPLOAD,
             title=title or filename,
             status=AssetStatus.PENDING,
+            tags=tags,
         )
+        if user_notes:
+            set_user_notes(asset, user_notes)
         db.add(asset)
         db.commit()
         db.refresh(asset)
-
-        ingestion = vision_ingest.ingest_asset(db, asset)
+        logger.info(
+            "Inventar-Upload gespeichert asset_id=%s type=%s mobile=%s bytes=%s",
+            asset.id,
+            asset_type.value,
+            mobile,
+            len(content),
+        )
 
         return AssetUploadResponse(
             asset_id=str(asset.id),
-            file_path=asset.file_path,
+            file_path=asset.file_path or "",
+            file_type=asset.file_type.value,
+            status=asset.status.value,
+            vision_result=None,
+            created_record=None,
+        )
+    finally:
+        db.close()
+
+
+def _ingest_asset_by_id(asset_id: str) -> None:
+    db = SessionLocal()
+    try:
+        asset = db.get(UnprocessedAsset, uuid.UUID(asset_id))
+        if asset is None:
+            return
+        vision_ingest.ingest_asset(db, asset)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Hintergrund-Ingestion fehlgeschlagen für %s: %s", asset_id, exc)
+    finally:
+        db.close()
+
+
+def _persist_upload_and_ingest(filename: str, content: bytes, title: str | None) -> AssetUploadResponse:
+    """Legacy-Pfad: speichern + sofort Vision (Desktop-Dropzone)."""
+    saved = _persist_upload(filename, content, title)
+    if saved.duplicate:
+        return saved
+    db = SessionLocal()
+    try:
+        asset = db.get(UnprocessedAsset, uuid.UUID(saved.asset_id))
+        if asset is None:
+            return saved
+        ingestion = vision_ingest.ingest_asset(db, asset)
+        db.refresh(asset)
+        return AssetUploadResponse(
+            asset_id=str(asset.id),
+            file_path=asset.file_path or "",
             file_type=asset.file_type.value,
             status=ingestion.get("status", asset.status.value),
             vision_result=asset.vision_result,
@@ -114,15 +178,42 @@ def _persist_upload_and_ingest(filename: str, content: bytes, title: str | None)
 
 
 @router.post("/inventory/upload", response_model=AssetUploadResponse)
-async def upload_asset(file: UploadFile = File(...), title: str | None = Form(None)) -> AssetUploadResponse:
-    """Nimmt eine beliebige Datei (Bild/CAD/PDF) entgegen, registriert sie in
-    der unstrukturierten Asset-Bibliothek (`unprocessed_assets`) und triggert
-    für Bilder sofort die KI-Vision-Pipeline (SPEC Kap. 2.3.2, 5.3)."""
+async def upload_asset(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    title: str | None = Form(None),
+    user_notes: str | None = Form(None),
+    auto_process: bool = Form(True),
+    defer_process: bool = Form(False),
+) -> AssetUploadResponse:
+    """Nimmt eine Datei entgegen und legt sie in der Inventar-DB an.
+
+    `defer_process=true` (Handy): speichert sofort, Vision läuft im Hintergrund –
+    verhindert Timeouts bei großen Fotos / langsamer Vision.
+    """
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Leere Datei hochgeladen.")
 
-    return await run_in_threadpool(_persist_upload_and_ingest, file.filename or "upload.bin", content, title)
+    filename = file.filename or "upload.bin"
+    # Content-Type image/* ohne sinnvolle Endung → .jpg anhängen
+    if "." not in Path(filename).name and (file.content_type or "").startswith("image/"):
+        subtype = (file.content_type or "image/jpeg").split("/", 1)[-1]
+        ext = "jpg" if subtype in ("jpeg", "jpg") else subtype.split("+")[0]
+        filename = f"{filename}.{ext}"
+
+    if defer_process:
+        from functools import partial
+
+        saved = await run_in_threadpool(
+            partial(_persist_upload, filename, content, title, user_notes=user_notes, mobile=True)
+        )
+        if not saved.duplicate and auto_process:
+            background_tasks.add_task(_ingest_asset_by_id, saved.asset_id)
+        return saved
+
+    result = await run_in_threadpool(_persist_upload_and_ingest, filename, content, title)
+    return result
 
 
 class ConceptToInventoryRequest(BaseModel):
@@ -403,13 +494,16 @@ class InventoryItemResponse(BaseModel):
     status: str
     tags: list[str]
     vision_result: dict[str, Any] | None
-    notes: str | None
+    notes: str | None  # Legacy-Alias: spiegelt ai_notes
+    user_notes: str | None
+    ai_notes: str | None
     error_message: str | None
     discovered_at: str
     processed_at: str | None
 
 
 def _asset_to_item_response(asset: UnprocessedAsset) -> InventoryItemResponse:
+    ai = asset.ai_notes if asset.ai_notes is not None else asset.notes
     return InventoryItemResponse(
         id=str(asset.id),
         title=asset.title,
@@ -420,7 +514,9 @@ def _asset_to_item_response(asset: UnprocessedAsset) -> InventoryItemResponse:
         status=asset.status.value,
         tags=asset.tags or [],
         vision_result=asset.vision_result,
-        notes=asset.notes,
+        notes=ai,
+        user_notes=asset.user_notes,
+        ai_notes=ai,
         error_message=asset.error_message,
         discovered_at=asset.discovered_at.isoformat(),
         processed_at=asset.processed_at.isoformat() if asset.processed_at else None,
@@ -454,6 +550,8 @@ def list_inventory_items(
             query = query.filter(
                 (UnprocessedAsset.title.ilike(like))
                 | (UnprocessedAsset.notes.ilike(like))
+                | (UnprocessedAsset.user_notes.ilike(like))
+                | (UnprocessedAsset.ai_notes.ilike(like))
                 | (UnprocessedAsset.file_path.ilike(like))
                 | (cast(UnprocessedAsset.vision_result, String).ilike(like))
             )
@@ -492,7 +590,8 @@ def list_inventory_items(
 
 class ManualEntryCreateRequest(BaseModel):
     title: str = Field(..., min_length=1)
-    notes: str | None = None
+    notes: str | None = None  # Legacy: wird als user_notes behandelt
+    user_notes: str | None = None
     tags: list[str] = Field(default_factory=list)
     auto_process: bool = Field(True, description="Sofort per KI/Heuristik strukturieren, statt nur anzulegen.")
 
@@ -501,16 +600,19 @@ class ManualEntryCreateRequest(BaseModel):
 def create_manual_entry(request: ManualEntryCreateRequest) -> InventoryItemResponse:
     """Legt einen manuellen Inventar-Eintrag ohne Datei an (Nutzer-Feedback:
     unstrukturierte Einträge sollen jederzeit manuell möglich sein)."""
+    from app.services.inventory_notes import set_user_notes
+
     db = SessionLocal()
     try:
+        user_text = request.user_notes if request.user_notes is not None else request.notes
         asset = UnprocessedAsset(
             title=request.title,
-            notes=request.notes,
             tags=request.tags,
             file_type=AssetFileType.MANUAL,
             source=AssetSource.MANUAL,
             status=AssetStatus.PENDING,
         )
+        set_user_notes(asset, user_text)
         db.add(asset)
         db.commit()
         db.refresh(asset)
@@ -526,14 +628,17 @@ def create_manual_entry(request: ManualEntryCreateRequest) -> InventoryItemRespo
 
 class InventoryItemUpdateRequest(BaseModel):
     title: str | None = None
-    notes: str | None = None
+    notes: str | None = None  # Legacy: mappt auf user_notes, wenn user_notes nicht gesetzt
+    user_notes: str | None = None
+    ai_notes: str | None = None
     tags: list[str] | None = None
 
 
 @router.patch("/inventory/items/{item_id}", response_model=InventoryItemResponse)
 def update_inventory_item(item_id: str, request: InventoryItemUpdateRequest) -> InventoryItemResponse:
-    """Manuelle Bearbeitung/Strukturierung eines Eintrags (Titel/Notiz/Tags) –
-    jederzeit statt/zusätzlich zur KI-Strukturierung möglich."""
+    """Manuelle Bearbeitung (Titel, User-/KI-Beschreibung, Tags)."""
+    from app.services.inventory_notes import set_ai_notes, set_user_notes
+
     db = SessionLocal()
     try:
         asset = db.get(UnprocessedAsset, uuid.UUID(item_id))
@@ -542,8 +647,13 @@ def update_inventory_item(item_id: str, request: InventoryItemUpdateRequest) -> 
 
         if request.title is not None:
             asset.title = request.title
-        if request.notes is not None:
-            asset.notes = request.notes
+        if request.user_notes is not None:
+            set_user_notes(asset, request.user_notes)
+        elif request.notes is not None and request.ai_notes is None:
+            # Alte Clients speicherten in `notes` die editierbare Beschreibung → User-Feld
+            set_user_notes(asset, request.notes)
+        if request.ai_notes is not None:
+            set_ai_notes(asset, request.ai_notes)
         if request.tags is not None:
             asset.tags = request.tags
 
@@ -809,3 +919,45 @@ def upsert_material(request: StockMaterialUpsertRequest) -> StockMaterialRespons
         return _stock_to_response(material)
     finally:
         db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inventory Knowledge Graph – anlernen / Status
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class KnowledgeGraphStatsResponse(BaseModel):
+    nodes: int = 0
+    edges: int = 0
+    learned_edges: int = 0
+    by_type: dict[str, int] = Field(default_factory=dict)
+    trained_at: str | None = None
+    updated_at: str | None = None
+
+
+class KnowledgeGraphTrainResponse(BaseModel):
+    path: str
+    nodes: int
+    edges: int
+    learned_edges: int = 0
+    by_type: dict[str, int] = Field(default_factory=dict)
+    trained_at: str | None = None
+    updated_at: str | None = None
+
+
+@router.get("/inventory/knowledge-graph", response_model=KnowledgeGraphStatsResponse)
+def get_inventory_knowledge_graph() -> KnowledgeGraphStatsResponse:
+    """Status des Inventory Knowledge Graphs (Nodes/Edges, letzter Trainingszeitpunkt)."""
+    from app.services.inventory_knowledge_graph import get_knowledge_graph_stats
+
+    stats = get_knowledge_graph_stats()
+    return KnowledgeGraphStatsResponse(**stats)
+
+
+@router.post("/inventory/knowledge-graph/train", response_model=KnowledgeGraphTrainResponse)
+def train_inventory_knowledge_graph_endpoint() -> KnowledgeGraphTrainResponse:
+    """Baut den Knowledge Graph aus aktuellen DB-Einträgen neu auf (gelernte Kanten bleiben)."""
+    from app.services.inventory_knowledge_graph import train_inventory_knowledge_graph
+
+    result = train_inventory_knowledge_graph()
+    return KnowledgeGraphTrainResponse(**result)

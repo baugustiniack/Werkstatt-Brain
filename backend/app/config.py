@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     # --- Chat-Logs & persistente Unterhaltungen ---
     agent_logs_dir: str = "/data/agent_logs"
     conversations_dir: str = "/data/conversations"
+    inventory_kg_path: str = "/data/inventory_knowledge_graph.json"
 
     @property
     def crawler_scan_path_list(self) -> list[str]:

@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from agents.graph import WORKFLOW
 from app.config import settings
 from app.services import paused_run_store
+from app.services.system_awake import keep_system_awake
 
 logger = logging.getLogger(__name__)
 
@@ -396,7 +397,8 @@ async def generate_cad(request: CadGenerateRequest) -> CadWorkflowResponse | Cad
     if request.blocking:
         config = {"configurable": {"thread_id": session_id}}
         logger.info("CAD-Workflow gestartet (blocking, session_id=%s)", session_id)
-        result = WORKFLOW.invoke(initial_state, config=config)
+        with keep_system_awake(f"cad-blocking:{session_id}"):
+            result = WORKFLOW.invoke(initial_state, config=config)
         resp = _build_response(session_id, result)
         _persist_session_transcript(session_id, result, status=resp.status)
         return resp
@@ -415,7 +417,8 @@ async def resume_cad(request: CadResumeRequest) -> CadWorkflowResponse:
     config = {"configurable": {"thread_id": request.session_id}}
 
     logger.info("CAD-Workflow fortgesetzt (session_id=%s)", request.session_id)
-    result = WORKFLOW.invoke(Command(resume=request.decision), config=config)
+    with keep_system_awake(f"cad-resume:{request.session_id}"):
+        result = WORKFLOW.invoke(Command(resume=request.decision), config=config)
 
     return _build_response(request.session_id, result)
 
@@ -1034,49 +1037,7 @@ async def stream_cad_workflow(websocket: WebSocket, session_id: str) -> None:
         graph_input = None  # Graph ist bereits pausiert; erster Schritt ist ein resume, kein neuer Input.
 
     try:
-        while True:
-            if session_id in CANCELLED_SESSIONS:
-                CANCELLED_SESSIONS.discard(session_id)
-                try:
-                    snap = WORKFLOW.get_state(config).values or {}
-                    if session_id not in PAUSED_RUNS:
-                        _remember_paused_run(session_id, snap)
-                    else:
-                        _remember_paused_run(session_id, snap, notify_chat=False)
-                    _persist_session_transcript(session_id, snap, status="cancelled")
-                except Exception:  # noqa: BLE001
-                    pass
-                await websocket.send_json({"type": "cancelled", "session_id": session_id})
-                return
-
-            escalation_payload = await _stream_once(websocket, graph_input, config, session_id)
-            if escalation_payload == "cancelled":
-                try:
-                    snap = WORKFLOW.get_state(config).values or {}
-                    if session_id not in PAUSED_RUNS:
-                        _remember_paused_run(session_id, snap)
-                    else:
-                        # Cancel-API hat schon Snapshot – Artefakte/Transcript nachziehen
-                        secured = _secure_completed_progress(snap)
-                        PAUSED_RUNS[session_id]["values"] = secured
-                        _persist_artifacts_only(session_id, secured)
-                        try:
-                            paused_run_store.save_paused_run(
-                                session_id,
-                                secured,
-                                conversation_id=SESSION_CONVERSATIONS.get(session_id),
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
-                    _persist_session_transcript(session_id, snap, status="cancelled")
-                except Exception:  # noqa: BLE001
-                    pass
-                return
-            if escalation_payload is None:
-                break  # regulär beendet oder Fehler
-
-            # Eskalation: auf Nutzerentscheidung über dieselbe Verbindung warten.
-            # Parallel Cancel prüfen (Client kann während Freigabe abbrechen).
+        with keep_system_awake(f"cad-stream:{session_id}"):
             while True:
                 if session_id in CANCELLED_SESSIONS:
                     CANCELLED_SESSIONS.discard(session_id)
@@ -1084,32 +1045,75 @@ async def stream_cad_workflow(websocket: WebSocket, session_id: str) -> None:
                         snap = WORKFLOW.get_state(config).values or {}
                         if session_id not in PAUSED_RUNS:
                             _remember_paused_run(session_id, snap)
+                        else:
+                            _remember_paused_run(session_id, snap, notify_chat=False)
                         _persist_session_transcript(session_id, snap, status="cancelled")
                     except Exception:  # noqa: BLE001
                         pass
                     await websocket.send_json({"type": "cancelled", "session_id": session_id})
                     return
-                try:
-                    message = await asyncio.wait_for(websocket.receive_json(), timeout=0.5)
-                    break
-                except asyncio.TimeoutError:
-                    continue
-                except WebSocketDisconnect:
-                    logger.info("Client während Eskalation getrennt (session_id=%s)", session_id)
+
+                escalation_payload = await _stream_once(websocket, graph_input, config, session_id)
+                if escalation_payload == "cancelled":
                     try:
                         snap = WORKFLOW.get_state(config).values or {}
-                        _remember_paused_run(session_id, snap)
+                        if session_id not in PAUSED_RUNS:
+                            _remember_paused_run(session_id, snap)
+                        else:
+                            # Cancel-API hat schon Snapshot – Artefakte/Transcript nachziehen
+                            secured = _secure_completed_progress(snap)
+                            PAUSED_RUNS[session_id]["values"] = secured
+                            _persist_artifacts_only(session_id, secured)
+                            try:
+                                paused_run_store.save_paused_run(
+                                    session_id,
+                                    secured,
+                                    conversation_id=SESSION_CONVERSATIONS.get(session_id),
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
                         _persist_session_transcript(session_id, snap, status="cancelled")
                     except Exception:  # noqa: BLE001
                         pass
                     return
-            decision = message.get("decision")
-            graph_input = Command(resume=decision)
+                if escalation_payload is None:
+                    break  # regulär beendet oder Fehler
 
-        final_state = WORKFLOW.get_state(config).values
-        response = _build_response(session_id, final_state)
-        _persist_session_transcript(session_id, final_state or {}, status=response.status)
-        await websocket.send_json({"type": "final", "result": response.model_dump()})
+                # Eskalation: auf Nutzerentscheidung über dieselbe Verbindung warten.
+                # Parallel Cancel prüfen (Client kann während Freigabe abbrechen).
+                while True:
+                    if session_id in CANCELLED_SESSIONS:
+                        CANCELLED_SESSIONS.discard(session_id)
+                        try:
+                            snap = WORKFLOW.get_state(config).values or {}
+                            if session_id not in PAUSED_RUNS:
+                                _remember_paused_run(session_id, snap)
+                            _persist_session_transcript(session_id, snap, status="cancelled")
+                        except Exception:  # noqa: BLE001
+                            pass
+                        await websocket.send_json({"type": "cancelled", "session_id": session_id})
+                        return
+                    try:
+                        message = await asyncio.wait_for(websocket.receive_json(), timeout=0.5)
+                        break
+                    except asyncio.TimeoutError:
+                        continue
+                    except WebSocketDisconnect:
+                        logger.info("Client während Eskalation getrennt (session_id=%s)", session_id)
+                        try:
+                            snap = WORKFLOW.get_state(config).values or {}
+                            _remember_paused_run(session_id, snap)
+                            _persist_session_transcript(session_id, snap, status="cancelled")
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return
+                decision = message.get("decision")
+                graph_input = Command(resume=decision)
+
+            final_state = WORKFLOW.get_state(config).values
+            response = _build_response(session_id, final_state)
+            _persist_session_transcript(session_id, final_state or {}, status=response.status)
+            await websocket.send_json({"type": "final", "result": response.model_dump()})
     except WebSocketDisconnect:
         logger.info("Client getrennt – Session pausiert (session_id=%s)", session_id)
         try:

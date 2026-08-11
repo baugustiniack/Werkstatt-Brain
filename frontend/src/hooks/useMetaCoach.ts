@@ -30,7 +30,30 @@ export interface WorkflowOverview {
   agents: Record<string, AgentProfile>;
   edges: WorkflowEdge[];
   config: WorkflowConfig;
+  enabled_agents?: string[];
+  fixed_agents?: string[];
+  active_config?: {
+    id?: string;
+    name?: string;
+    is_standard?: boolean;
+    description?: string | null;
+  } | null;
   profiles_updated_at?: string | null;
+}
+
+export interface AgentWorkflowConfigRow {
+  id: string;
+  name: string;
+  description?: string | null;
+  is_standard: boolean;
+  is_active: boolean;
+  agents: Record<string, AgentProfile>;
+  edges: WorkflowEdge[];
+  config: WorkflowConfig;
+  enabled_agents: string[];
+  fixed_agents: string[];
+  created_at?: string | null;
+  updated_at?: string | null;
 }
 
 export interface MetaCoachChatMessage {
@@ -38,9 +61,18 @@ export interface MetaCoachChatMessage {
   content: string;
 }
 
+export interface MetaCoachRecommendation {
+  type?: string;
+  agent?: string | null;
+  title?: string;
+  detail?: string;
+  priority?: string;
+}
+
 export interface MetaCoachChatResponse {
   reply: string;
   actions: Record<string, unknown>[];
+  recommendations?: MetaCoachRecommendation[];
   applied_changes: Record<string, unknown>[];
   referenced_logs: unknown[];
   llm_configured: boolean;
@@ -56,11 +88,110 @@ export interface MetaCoachLogSummary {
 }
 
 const KEY = "meta-coach";
+const WF_KEY = "agent-workflows";
 
 export function useWorkflowOverview() {
   return useQuery({
     queryKey: [KEY, "workflow"],
     queryFn: () => api.get<WorkflowOverview>("/api/v1/meta-coach/workflow"),
+  });
+}
+
+export function useAgentWorkflowConfigs() {
+  return useQuery({
+    queryKey: [WF_KEY],
+    queryFn: () => api.get<AgentWorkflowConfigRow[]>("/api/v1/agent-workflows"),
+  });
+}
+
+export function useActivateWorkflow() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.post<AgentWorkflowConfigRow>(`/api/v1/agent-workflows/${id}/activate`, {}),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: [WF_KEY] });
+      void qc.invalidateQueries({ queryKey: [KEY, "workflow"] });
+    },
+  });
+}
+
+export function useActivateStandardWorkflow() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<AgentWorkflowConfigRow>("/api/v1/agent-workflows/standard/activate", {}),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: [WF_KEY] });
+      void qc.invalidateQueries({ queryKey: [KEY, "workflow"] });
+    },
+  });
+}
+
+export function useSaveWorkflowConfig() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: {
+      name: string;
+      description?: string;
+      agents?: Record<string, AgentProfile>;
+      edges?: WorkflowEdge[];
+      enabled_agents?: string[];
+      config?: Partial<WorkflowConfig>;
+      activate?: boolean;
+    }) => api.post<AgentWorkflowConfigRow>("/api/v1/agent-workflows", body),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: [WF_KEY] });
+      void qc.invalidateQueries({ queryKey: [KEY, "workflow"] });
+    },
+  });
+}
+
+export function useUpdateActiveWorkflow() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: {
+      enabled_agents?: string[];
+      config?: Partial<WorkflowConfig>;
+      description?: string;
+      name?: string;
+    }) => api.patch<AgentWorkflowConfigRow>("/api/v1/agent-workflows/active", body),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: [WF_KEY] });
+      void qc.invalidateQueries({ queryKey: [KEY, "workflow"] });
+    },
+  });
+}
+
+export function useUpdateActiveAgentProperty() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      agentId,
+      property,
+      value,
+    }: {
+      agentId: string;
+      property: string;
+      value: unknown;
+    }) =>
+      api.patch<{ agent_id: string; agent: AgentProfile }>(
+        `/api/v1/agent-workflows/active/agents/${agentId}`,
+        { property, value },
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: [WF_KEY] });
+      void qc.invalidateQueries({ queryKey: [KEY, "workflow"] });
+    },
+  });
+}
+
+export function useDeleteWorkflowConfig() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.delete<{ status: string }>(`/api/v1/agent-workflows/${id}`),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: [WF_KEY] });
+      void qc.invalidateQueries({ queryKey: [KEY, "workflow"] });
+    },
   });
 }
 
@@ -72,17 +203,14 @@ export function useMetaCoachLogs(limit = 80) {
 }
 
 export function useMetaCoachChat() {
-  const qc = useQueryClient();
   return useMutation({
     mutationFn: (body: {
       messages: MetaCoachChatMessage[];
       log_names?: string[];
-      apply_actions?: boolean;
-    }) => api.post<MetaCoachChatResponse>("/api/v1/meta-coach/chat", body),
-    onSuccess: (data) => {
-      if (data.applied_changes?.length) {
-        qc.invalidateQueries({ queryKey: [KEY, "workflow"] });
-      }
-    },
+    }) =>
+      api.post<MetaCoachChatResponse>("/api/v1/meta-coach/chat", {
+        ...body,
+        apply_actions: false,
+      }),
   });
 }

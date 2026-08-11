@@ -165,6 +165,8 @@ export interface AgentTranscriptEntry {
 export type AgentNodeName =
   | "supervisor"
   | "flexible_specialist"
+  | "custom_agent_1"
+  | "custom_agent_2"
   | "vv_manager"
   | "concept_builder"
   | "inventory_manager"
@@ -247,7 +249,10 @@ export interface InventoryItem {
   status: AssetStatus;
   tags: string[];
   vision_result: Record<string, unknown> | null;
+  /** @deprecated Alias für ai_notes */
   notes: string | null;
+  user_notes: string | null;
+  ai_notes: string | null;
   error_message: string | null;
   discovered_at: string;
   processed_at: string | null;
@@ -262,6 +267,7 @@ export interface InventoryItemListResponse {
 export interface ManualEntryCreateRequest {
   title: string;
   notes?: string;
+  user_notes?: string;
   tags?: string[];
   auto_process?: boolean;
 }
@@ -269,6 +275,8 @@ export interface ManualEntryCreateRequest {
 export interface InventoryItemUpdateRequest {
   title?: string;
   notes?: string;
+  user_notes?: string;
+  ai_notes?: string;
   tags?: string[];
 }
 

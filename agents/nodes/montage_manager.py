@@ -120,7 +120,10 @@ def _load_montage_tools() -> list[dict[str, Any]]:
             for asset in assets:
                 tags = asset.tags or []
                 title = (asset.title or asset.file_path or "")[:120]
-                blob = f"{title} {' '.join(tags)} {(asset.notes or '')[:200]}".lower()
+                blob = (
+                    f"{title} {' '.join(tags)} {(asset.user_notes or '')[:120]} "
+                    f"{(asset.ai_notes or asset.notes or '')[:200]}"
+                ).lower()
                 if any(k in blob for k in keywords) or any(
                     t.lower() in ("werkzeug", "tool", "montage", "handwerkzeug") for t in tags
                 ):
@@ -131,7 +134,10 @@ def _load_montage_tools() -> list[dict[str, Any]]:
                             "name": title or str(asset.id)[:8],
                             "file_type": asset.file_type.value if asset.file_type else None,
                             "tags": tags[:8],
-                            "notes": (asset.notes or "")[:240],
+                            "notes": (
+                                ((asset.user_notes or "") + "\n" + (asset.ai_notes or asset.notes or ""))
+                                .strip()
+                            )[:240],
                         }
                     )
         finally:
