@@ -53,6 +53,11 @@ class AgentState(TypedDict, total=False):
     messages: Annotated[list[Any], add_messages]
     human_approval_required: bool
 
+    # Chat-Referenzbilder (Asset-UUIDs aus Anhangszeilen id=…)
+    reference_asset_ids: list[str]
+    # Textanalyse der Referenzfotos (Anthropic bevorzugt) – für alle Agenten + Image-Prompts
+    reference_vision_brief: str
+
     # --- Erweiterungen für Routing, Eskalation & Meta-Coach-Logging ---
     session_id: str
     conversation_id: str | None
@@ -62,10 +67,36 @@ class AgentState(TypedDict, total=False):
 
     # --- Konzept-Freigabe & Mehrteil-Ausarbeitung (Nutzer-Feedback) ---
     concept_sketch_svg: str | None  # technische Draufsicht (Fallback / eingeklappt)
-    concept_image_url: str | None  # fotorealistisches Raumfoto (OpenAI Images)
+    concept_image_url: str | None  # primäres Konzeptbild (Übersicht)
+    concept_image_urls: list[dict[str, Any]]  # Galerie: overview / part / floorplan
     concept_approved: bool
+    concept_revision: bool  # True nach Nutzer-Feedback am Konzept
+    last_concept_feedback: str | None
     current_part_index: int
     completed_parts: list[dict[str, Any]]
+
+    # --- Innenarchitekt ---
+    interior_brief: dict[str, Any]
+    interior_consulted: bool
+
+    # Schonungslose Bild↔Text↔Konzept-Prüfung
+    coherence_critique: dict[str, Any]
+    concept_critiqued: bool
+    concept_open_questions: list[str]
+    concept_qa_answers: list[dict[str, Any]]
+    concept_open_points_cleared: bool
+    concept_clarify_rounds: int
+
+    # Konzept-Jury (Konsens mit Schulnoten, Version B = nur aktuelle Runde)
+    concept_panel_round: int
+    concept_panel_queue: list[str]
+    concept_panel_grades: list[dict[str, Any]]
+    concept_panel_average: float | None
+    concept_panel_passed: bool
+    concept_panel_forced: bool
+    concept_panel_done: bool
+    concept_panel_awaiting_rebuild: bool
+    panel_reviewer_id: str | None
 
     # --- V&V / Flexible / Fertigung ---
     # vv_requirements: phasenweise Requirements (concept → design → manufacturing)
@@ -75,6 +106,10 @@ class AgentState(TypedDict, total=False):
     vv_needs_alignment: bool
     # Antworten aus dem V&V-Fragen-Interview (Frage → Antwort)
     vv_qa_answers: list[dict[str, Any]]
+    # Frozen Design Spec (Single Source of Truth nach Concept-V&V)
+    design_spec: dict[str, Any]
+    # Letzte abgelehnte V&V-Antwort (zu ungenau) – Frage erneut stellen
+    vv_last_rejected_answer: dict[str, Any] | None
     # --- Flexible / Leer-Agenten ---
     flexible_specialist_profile: dict[str, Any]
     advisory_notes: str

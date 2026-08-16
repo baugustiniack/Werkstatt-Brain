@@ -23,9 +23,11 @@ from __future__ import annotations
 import logging
 import mimetypes
 import os
+import tempfile
 import uuid
 from dataclasses import asdict
 from decimal import Decimal
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -63,32 +65,84 @@ class AssetUploadResponse(BaseModel):
     created_record: dict[str, Any] | None = None
 
 
-def _persist_upload(
+_STORE_MAX_SIDE = int(os.getenv("STORE_IMAGE_MAX_SIDE", "1280"))
+_STORE_MAX_BYTES = int(os.getenv("STORE_IMAGE_MAX_BYTES", str(900_000)))
+
+
+def _looks_like_image(filename: str, header: bytes) -> bool:
+    name = filename.lower()
+    if name.endswith((".heic", ".heif", ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")):
+        return True
+    if len(header) >= 3 and header[:3] == b"\xff\xd8\xff":
+        return True
+    if len(header) >= 8 and header[:8] == b"\x89PNG\r\n\x1a\n":
+        return True
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return True
+    return False
+
+
+def _recompress_image_file(src: Path, dest: Path) -> int:
+    """Schreibt komprimiertes JPEG nach dest; gibt Bytegröße zurück. Bei Fehler: copy."""
+    try:
+        from PIL import Image
+
+        with Image.open(src) as img:
+            img = img.convert("RGB")
+            w, h = img.size
+            scale = min(1.0, _STORE_MAX_SIDE / max(w, h, 1))
+            if scale < 1.0:
+                img = img.resize(
+                    (max(1, int(w * scale)), max(1, int(h * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            quality = 78
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=quality, optimize=True)
+            while buf.tell() > _STORE_MAX_BYTES and quality > 45:
+                quality -= 8
+                buf = BytesIO()
+                img.save(buf, format="JPEG", quality=quality, optimize=True)
+            data = buf.getvalue()
+            dest.write_bytes(data)
+            return len(data)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Bild-Rekompression fehlgeschlagen (%s): %s – Rohkopie", src.name, exc)
+        dest.write_bytes(src.read_bytes())
+        return dest.stat().st_size
+
+
+def _persist_upload_from_path(
     filename: str,
-    content: bytes,
+    src_path: Path,
     title: str | None,
     *,
     user_notes: str | None = None,
     mobile: bool = False,
 ) -> AssetUploadResponse:
-    """Speichert Datei + DB-Eintrag sofort (ohne Vision) – wichtig für Handy-Uploads."""
+    """Speichert Datei (ggf. Bild-Rekompression) + DB-Eintrag ohne Vision."""
     from app.services.inventory_notes import set_user_notes
 
     upload_dir = Path(settings.uploads_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_name = f"{uuid.uuid4().hex[:12]}_{Path(filename).name}"
-    dest_path = upload_dir / safe_name
-    dest_path.write_bytes(content)
+    header = src_path.read_bytes()[:32] if src_path.is_file() else b""
+    is_image = _looks_like_image(filename, header)
 
-    asset_type = crawler.classify_file_type(dest_path)
-    # iPhone liefert oft image.jpg ohne Endung oder HEIC – per Content trotzdem als Bild
-    if asset_type == AssetFileType.OTHER and (
-        filename.lower().endswith((".heic", ".heif", ".jpg", ".jpeg", ".png", ".webp"))
-        or (len(content) > 12 and content[:3] == b"\xff\xd8\xff")  # JPEG SOI
-        or content[:8] == b"\x89PNG\r\n\x1a\n"
-    ):
+    if is_image and not filename.lower().endswith((".heic", ".heif")):
+        stem = Path(filename).stem or "upload"
+        safe_name = f"{uuid.uuid4().hex[:12]}_{stem}.jpg"
+        dest_path = upload_dir / safe_name
+        size = _recompress_image_file(src_path, dest_path)
         asset_type = AssetFileType.IMAGE
+    else:
+        safe_name = f"{uuid.uuid4().hex[:12]}_{Path(filename).name}"
+        dest_path = upload_dir / safe_name
+        dest_path.write_bytes(src_path.read_bytes())
+        size = dest_path.stat().st_size
+        asset_type = crawler.classify_file_type(dest_path)
+        if asset_type == AssetFileType.OTHER and is_image:
+            asset_type = AssetFileType.IMAGE
 
     file_hash = crawler.compute_file_hash(dest_path)
 
@@ -126,7 +180,7 @@ def _persist_upload(
             asset.id,
             asset_type.value,
             mobile,
-            len(content),
+            size,
         )
 
         return AssetUploadResponse(
@@ -139,6 +193,29 @@ def _persist_upload(
         )
     finally:
         db.close()
+
+
+def _persist_upload(
+    filename: str,
+    content: bytes,
+    title: str | None,
+    *,
+    user_notes: str | None = None,
+    mobile: bool = False,
+) -> AssetUploadResponse:
+    """Kompatibilitäts-Wrapper: bytes → Tempdatei → Persistenz."""
+    upload_dir = Path(settings.uploads_dir)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix="up_", suffix=".part", dir=str(upload_dir))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        tmp_path.write_bytes(content)
+        return _persist_upload_from_path(
+            filename, tmp_path, title, user_notes=user_notes, mobile=mobile
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def _ingest_asset_by_id(asset_id: str) -> None:
@@ -189,51 +266,68 @@ async def upload_asset(
 ) -> AssetUploadResponse:
     """Nimmt eine Datei entgegen und legt sie in der Inventar-DB an.
 
-    `defer_process=true` (Handy/Chat): speichert sofort, Vision läuft im Hintergrund –
-    verhindert Timeouts und RAM-Spitzen bei großen Fotos.
+    Streamt auf Disk (kein volles RAM-Join). Bilder werden serverseitig
+    rekomprimiert. `defer_process` / große Dateien: Vision nur im Hintergrund.
     """
-    max_bytes = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
-    sync_vision_max = int(os.getenv("SYNC_VISION_MAX_BYTES", str(2 * 1024 * 1024)))
+    from functools import partial
 
-    chunks: list[bytes] = []
+    max_bytes = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
+    sync_vision_max = int(os.getenv("SYNC_VISION_MAX_BYTES", str(1 * 1024 * 1024)))
+
+    upload_dir = Path(settings.uploads_dir)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix="recv_", suffix=".part", dir=str(upload_dir))
+    os.close(fd)
+    tmp_path = Path(tmp_name)
     total = 0
-    while True:
-        chunk = await file.read(1024 * 1024)
-        if not chunk:
-            break
-        total += len(chunk)
-        if total > max_bytes:
-            raise HTTPException(
-                status_code=413,
-                detail=f"Datei zu groß (max. {max_bytes // (1024 * 1024)} MB). Bitte verkleinern.",
+    try:
+        with tmp_path.open("wb") as out:
+            while True:
+                chunk = await file.read(256 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"Datei zu groß (max. {max_bytes // (1024 * 1024)} MB). "
+                            "Bitte im Chat Fotos komprimieren oder weniger Anhänge."
+                        ),
+                    )
+                out.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=400, detail="Leere Datei hochgeladen.")
+
+        filename = file.filename or "upload.bin"
+        if "." not in Path(filename).name and (file.content_type or "").startswith("image/"):
+            subtype = (file.content_type or "image/jpeg").split("/", 1)[-1]
+            ext = "jpg" if subtype in ("jpeg", "jpg") else subtype.split("+")[0]
+            filename = f"{filename}.{ext}"
+
+        # Große Dateien / Chat-Defer: nie synchron visionen (Host-Schutz)
+        use_defer = defer_process or total > sync_vision_max or not auto_process
+
+        if use_defer:
+            saved = await run_in_threadpool(
+                partial(
+                    _persist_upload_from_path,
+                    filename,
+                    tmp_path,
+                    title,
+                    user_notes=user_notes,
+                    mobile=True,
+                )
             )
-        chunks.append(chunk)
-    content = b"".join(chunks)
-    if not content:
-        raise HTTPException(status_code=400, detail="Leere Datei hochgeladen.")
+            if not saved.duplicate and auto_process:
+                background_tasks.add_task(_ingest_asset_by_id, saved.asset_id)
+            return saved
 
-    filename = file.filename or "upload.bin"
-    # Content-Type image/* ohne sinnvolle Endung → .jpg anhängen
-    if "." not in Path(filename).name and (file.content_type or "").startswith("image/"):
-        subtype = (file.content_type or "image/jpeg").split("/", 1)[-1]
-        ext = "jpg" if subtype in ("jpeg", "jpg") else subtype.split("+")[0]
-        filename = f"{filename}.{ext}"
-
-    # Große Dateien nie synchron visionen (OOM-Schutz im 1g-Container)
-    use_defer = defer_process or total > sync_vision_max
-
-    if use_defer:
-        from functools import partial
-
-        saved = await run_in_threadpool(
-            partial(_persist_upload, filename, content, title, user_notes=user_notes, mobile=True)
-        )
-        if not saved.duplicate and auto_process:
-            background_tasks.add_task(_ingest_asset_by_id, saved.asset_id)
-        return saved
-
-    result = await run_in_threadpool(_persist_upload_and_ingest, filename, content, title)
-    return result
+        content = tmp_path.read_bytes()
+        result = await run_in_threadpool(_persist_upload_and_ingest, filename, content, title)
+        return result
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 class ConceptToInventoryRequest(BaseModel):

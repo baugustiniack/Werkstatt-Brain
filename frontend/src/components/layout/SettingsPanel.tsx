@@ -76,13 +76,14 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
           <span className="font-semibold text-workshop-text">
             {isLoading ? "…" : status?.active_provider === "none" ? "keiner (Heuristik)" : status?.active_provider}
           </span>
-          {status?.llm_provider === "auto" && " · Auto wählt Anthropic vor Cursor"}
+          {status?.llm_provider === "auto" && " · Auto: Anthropic-Key falls vorhanden, sonst Cursor"}
+          {" · Cursor = Agenten (+ Referenzfotos im Workspace); OpenAI = Konzeptbild-Generierung"}
         </p>
 
         {/* Anthropic */}
-        <label className="mb-1 block text-xs font-semibold text-workshop-muted">Anthropic (Claude) API-Key</label>
+        <label className="mb-1 block text-xs font-semibold text-workshop-muted">Anthropic (Claude) API-Key – optional</label>
         <p className="mb-2 text-xs text-workshop-muted">
-          Concept Builder &amp; 3D Builder (Text). Keine Inventar-Bildanalyse.
+          Optional. Ohne Key: Cursor-Modelle für Agenten inkl. Referenzfotos.
         </p>
         <div className="mb-2 flex items-center gap-2 text-xs">
           <span

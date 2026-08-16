@@ -399,10 +399,10 @@ def is_vision_configured() -> bool:
     return bool(settings_store.resolve_openai_api_key())
 
 
-# Eine Vision-Analyse gleichzeitig – verhindert OOM im 1g-API-Container
+# Eine Vision-Analyse gleichzeitig – verhindert OOM / Host-Freeze
 _VISION_SEM = threading.Semaphore(1)
-_VISION_MAX_SIDE = 1600
-_VISION_MAX_BYTES = 1_800_000
+_VISION_MAX_SIDE = 1024
+_VISION_MAX_BYTES = 900_000
 
 
 def _prepare_vision_image(path: Path) -> tuple[bytes, str]:
@@ -424,11 +424,11 @@ def _prepare_vision_image(path: Path) -> tuple[bytes, str]:
             if scale < 1.0:
                 img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
             buf = BytesIO()
-            img.save(buf, format="JPEG", quality=82, optimize=True)
+            img.save(buf, format="JPEG", quality=72, optimize=True)
             out = buf.getvalue()
             if len(out) > _VISION_MAX_BYTES:
                 buf = BytesIO()
-                img.save(buf, format="JPEG", quality=65, optimize=True)
+                img.save(buf, format="JPEG", quality=55, optimize=True)
                 out = buf.getvalue()
             return out, "image/jpeg"
     except Exception as exc:  # noqa: BLE001

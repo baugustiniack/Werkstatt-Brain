@@ -179,6 +179,7 @@ def persist_session_artifacts(
                         "concept_sketch_svg": values.get("concept_sketch_svg"),
                         "vv_requirements": values.get("vv_requirements"),
                         "concept_image_url": values.get("concept_image_url"),
+                        "concept_image_urls": values.get("concept_image_urls"),
                         "session_id": cad_session_id,
                     },
                 )

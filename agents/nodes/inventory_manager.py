@@ -130,13 +130,9 @@ def _fetch_relevant_assets(
     *,
     conversation_id: str | None = None,
     limit: int = 8,
+    reference_asset_ids: list[str] | None = None,
 ) -> list[dict]:
-    """Lädt indizierte Assets inkl. Beschreibung für den 3D-Builder-Kontext.
-
-    Priorität: KI-Modelle/Konzepte derselben Unterhaltung, dann Keyword-Match,
-    dann neueste beschriebene Assets. So erkennt der Inventory Manager
-    Chat-generierte STEP/STL (Tags KI-Generiert / generated_3d / conversation:…).
-    """
+    """Lädt Assets inkl. Beschreibung – zuerst explizite Chat-Referenz-IDs."""
     keywords = _keywords_from_part(part)
     base = (
         select(UnprocessedAsset)
@@ -155,6 +151,20 @@ def _fetch_relevant_assets(
             assets.append(asset)
             if len(assets) >= limit:
                 return
+
+    # 0) Explizit angehängte Chat-Referenzen (auch PENDING ohne Vision)
+    if reference_asset_ids:
+        import uuid as _uuid
+
+        for raw_id in reference_asset_ids:
+            if len(assets) >= limit:
+                break
+            try:
+                asset = db.get(UnprocessedAsset, _uuid.UUID(str(raw_id)))
+            except ValueError:
+                continue
+            if asset is not None:
+                _add([asset])
 
     # 1) Dieselbe Chat-Unterhaltung (Konzept + generierte 3D-Modelle)
     if conversation_id:
@@ -231,7 +241,14 @@ def _fetch_relevant_assets(
     for asset in assets[:limit]:
         description = _asset_description(asset)
         if not description and "KI-Generiert" not in (asset.tags or []):
-            continue
+            # Chat-Referenz ohne Vision: trotzdem mitgeben (Datei-Pfad / Titel)
+            if reference_asset_ids and str(asset.id) in {str(x) for x in reference_asset_ids}:
+                description = (
+                    f"Chat-Referenzbild (noch ohne KI-Beschreibung): "
+                    f"{asset.title or asset.file_path}"
+                )
+            else:
+                continue
         if not description:
             description = (
                 f"KI-generiertes Inventar-Asset ({asset.file_type.value if asset.file_type else 'datei'}): "
@@ -264,6 +281,9 @@ def inventory_manager_node(state: AgentState) -> AgentState:
     constraints = part.get("material_tool_constraints", {})
     conversation_id = state.get("conversation_id")
     keywords = _keywords_from_part(part)
+    from agents.reference_images import resolve_reference_asset_ids
+
+    reference_asset_ids = resolve_reference_asset_ids(state)
 
     # Knowledge Graph: gelernte Assoziationen (parallel zum Direkt-DB-Zugriff)
     kg_result: dict = {"hits": [], "summary": "KG nicht abgefragt", "stats": {}}
@@ -291,7 +311,12 @@ def inventory_manager_node(state: AgentState) -> AgentState:
     try:
         tool_match = _find_matching_tool(db, constraints.get("tool_diameter_mm"))
         stock_match = _find_matching_stock(db, constraints.get("material_type"), constraints.get("plate_thickness_mm"))
-        relevant_assets = _fetch_relevant_assets(db, part, conversation_id=conversation_id)
+        relevant_assets = _fetch_relevant_assets(
+            db,
+            part,
+            conversation_id=conversation_id,
+            reference_asset_ids=reference_asset_ids,
+        )
 
         # KG-Hinweise können DB-Treffer ergänzen / priorisieren
         kg_tool_hints = [

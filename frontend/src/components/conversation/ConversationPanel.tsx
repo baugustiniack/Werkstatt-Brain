@@ -15,6 +15,8 @@ import {
 import { StatusBadge } from "../layout/StatusBadge";
 import type { ReferenceMediaPreview } from "../modelViewer/ModelViewer";
 import { ReferenceUpload } from "../commandCenter/ReferenceUpload";
+import { ClarificationPanel } from "../agentTrace/EscalationDialog";
+import { assetFileUrl } from "../inventory/AssetPreview";
 
 const ACTIVE_CONV_KEY = "werkstatt.activeConversationId";
 
@@ -28,6 +30,14 @@ type ContractParts = NonNullable<EscalationPayload["requirements_contract"]>["pa
 function ConceptImageCard({
   title,
   imageUrl,
+  imageUrls,
+  sessionId,
+  referenceAssetIds,
+  coherenceCritique,
+  panelGrades,
+  panelAverage,
+  panelForced,
+  panelRound,
   parts,
   interactive,
   onDecision,
@@ -36,6 +46,15 @@ function ConceptImageCard({
 }: {
   title: string;
   imageUrl: string | null;
+  imageUrls?: Array<{ url: string; label?: string; kind?: string }> | null;
+  /** CAD-Session – Fallback, Galerie von Disk nachladen */
+  sessionId?: string | null;
+  referenceAssetIds?: string[] | null;
+  coherenceCritique?: EscalationPayload["coherence_critique"];
+  panelGrades?: EscalationPayload["concept_panel_grades"];
+  panelAverage?: number | null;
+  panelForced?: boolean;
+  panelRound?: number | null;
   parts?: ContractParts;
   interactive?: boolean;
   onDecision?: (decision: ConceptDecision) => void;
@@ -46,13 +65,82 @@ function ConceptImageCard({
   const [mode, setMode] = useState<"view" | "revise">("view");
   const [feedback, setFeedback] = useState("");
   const [partsOpen, setPartsOpen] = useState(false);
+  const [activeIdx, setActiveIdx] = useState(0);
+  const [fetchedUrls, setFetchedUrls] = useState<Array<{
+    url: string;
+    label?: string;
+    kind?: string;
+  }> | null>(null);
   const partList = parts ?? [];
+
+  useEffect(() => {
+    const sid = sessionId?.trim();
+    const have = (imageUrls?.length ?? 0) > 1;
+    if (!sid || have) {
+      setFetchedUrls(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const data = await api.get<{
+          items: Array<{ url: string; label?: string; kind?: string }>;
+        }>(`/api/v1/cad/concept-image/${encodeURIComponent(sid)}/gallery`);
+        if (!cancelled && (data.items?.length ?? 0) > 1) {
+          setFetchedUrls(data.items);
+        }
+      } catch {
+        if (!cancelled) setFetchedUrls(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, imageUrls]);
+
+  const gallery = useMemo(() => {
+    const source =
+      (imageUrls?.length ?? 0) > 1
+        ? imageUrls
+        : (fetchedUrls?.length ?? 0) > 1
+          ? fetchedUrls
+          : imageUrls;
+    const fromList = (source ?? [])
+      .map((v) => ({
+        url: resolveMediaUrl(v.url) || "",
+        label: v.label || v.kind || "Ansicht",
+        kind: v.kind,
+      }))
+      .filter((v) => v.url);
+    if (fromList.length > 0) {
+      // Übersicht zuerst, dann Grundriss, dann Details
+      const rank = (k?: string) =>
+        k === "overview" ? 0 : k === "floorplan" ? 1 : 2;
+      return [...fromList].sort((a, b) => rank(a.kind) - rank(b.kind));
+    }
+    const single = resolveMediaUrl(imageUrl);
+    return single ? [{ url: single, label: "Raumsituation (maßgeblich)", kind: "overview" }] : [];
+  }, [imageUrl, imageUrls, fetchedUrls]);
+
+  useEffect(() => {
+    const overviewIdx = gallery.findIndex((g) => g.kind === "overview");
+    setActiveIdx(overviewIdx >= 0 ? overviewIdx : 0);
+  }, [gallery.length, gallery[0]?.url]);
+
+  const active = gallery[Math.min(activeIdx, Math.max(gallery.length - 1, 0))] ?? null;
+
+  const kindBadge = (kind?: string) => {
+    if (kind === "overview") return "Maßgeblich";
+    if (kind === "floorplan") return "Grundriss";
+    if (kind === "part") return "Detail";
+    return "Ansicht";
+  };
 
   return (
     <div className="rounded-lg border border-workshop-accent/60 bg-workshop-bg/80 p-3">
       <div className="mb-2 flex items-start justify-between gap-2">
         <div className="text-xs font-semibold text-workshop-accent">
-          {interactive ? `Konzept zur Freigabe: ${title}` : `Konzept-Foto: ${title}`}
+          {interactive ? `Konzept zur Freigabe: ${title}` : `Konzept: ${title}`}
         </div>
         <span
           className="shrink-0 rounded border border-workshop-border px-1.5 py-0.5 text-[10px] text-workshop-muted"
@@ -62,17 +150,156 @@ function ConceptImageCard({
         </span>
       </div>
 
-      {imageUrl ? (
-        <a href={imageUrl} target="_blank" rel="noreferrer" className="block">
-          <img
-            src={imageUrl}
-            alt={title}
-            className="mb-3 max-h-72 w-full rounded-md border border-workshop-border object-cover"
-          />
-        </a>
+      {gallery.length > 1 && (
+        <p className="mb-2 text-[11px] leading-snug text-workshop-muted">
+          Freigabe gilt für das <span className="text-workshop-text">Gesamt-Konzept</span> (
+          Ansicht „Maßgeblich“). Weitere Bilder sind Zusatzansichten desselben Entwurfs – keine
+          Alternativ-Varianten zum Auswählen.
+        </p>
+      )}
+
+      {(panelGrades?.length ?? 0) > 0 && (
+        <div className="mb-3 rounded border border-workshop-accent/40 bg-workshop-accent/5 px-2.5 py-2">
+          <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-workshop-accent">
+            Jury-Notenspiegel
+            {panelRound ? ` · Runde ${panelRound}` : ""}
+            {panelAverage != null ? ` · Schnitt ${panelAverage}` : ""}
+            {panelForced ? " · Max-Runden (Restrisiko)" : ""}
+          </div>
+          <ul className="space-y-1 text-[11px] text-workshop-text">
+            {panelGrades!.map((g, i) => (
+              <li key={`${g.agent_id ?? "a"}-${i}`} className="flex gap-2">
+                <span className="w-6 shrink-0 font-semibold text-workshop-accent">{g.grade ?? "–"}</span>
+                <span className="min-w-0">
+                  <span className="font-medium">{g.agent_id ?? "Agent"}</span>
+                  {g.verdict ? <span className="text-workshop-muted"> – {g.verdict}</span> : null}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {(referenceAssetIds?.length ?? 0) > 0 && (
+        <div className="mb-2 rounded border border-workshop-border/80 bg-workshop-panel/60 px-2 py-1.5">
+          <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-workshop-accent">
+            Deine Referenzfotos an die KI ({referenceAssetIds!.length})
+          </div>
+          <div className="flex gap-1.5 overflow-x-auto">
+            {referenceAssetIds!.slice(0, 8).map((id) => (
+              <a
+                key={id}
+                href={assetFileUrl(id)}
+                target="_blank"
+                rel="noreferrer"
+                className="shrink-0 overflow-hidden rounded border border-workshop-border"
+                title={id}
+              >
+                <img src={assetFileUrl(id)} alt="Referenz" className="h-12 w-12 object-cover" loading="lazy" />
+              </a>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {coherenceCritique &&
+        (coherenceCritique.summary ||
+          (coherenceCritique.contradictions?.length ?? 0) > 0 ||
+          (coherenceCritique.logic_gaps?.length ?? 0) > 0 ||
+          (coherenceCritique.missing_information?.length ?? 0) > 0 ||
+          (coherenceCritique.concept_issues?.length ?? 0) > 0) && (
+          <div className="mb-3 rounded border border-workshop-warning/50 bg-workshop-warning/10 px-2.5 py-2">
+            <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-workshop-warning">
+              Prüfung Bild ↔ Text ↔ Konzept
+              {coherenceCritique.severity ? ` · ${coherenceCritique.severity}` : ""}
+              {coherenceCritique.verdict ? ` · ${coherenceCritique.verdict}` : ""}
+            </div>
+            {coherenceCritique.summary && (
+              <p className="mb-1.5 text-[11px] leading-snug text-workshop-text">{coherenceCritique.summary}</p>
+            )}
+            {(
+              [
+                ["Widersprüche", coherenceCritique.contradictions],
+                ["Logiklücken", coherenceCritique.logic_gaps],
+                ["Fehlende Infos", coherenceCritique.missing_information],
+                ["Konzept-Mängel", coherenceCritique.concept_issues],
+                ["Zu klären", coherenceCritique.must_ask_user],
+              ] as const
+            ).map(([label, items]) =>
+              items && items.length > 0 ? (
+                <div key={label} className="mb-1">
+                  <div className="text-[10px] font-semibold text-workshop-muted">{label}</div>
+                  <ul className="list-inside list-disc text-[11px] text-workshop-text">
+                    {items.slice(0, 6).map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null,
+            )}
+          </div>
+        )}
+
+      {active ? (
+        <div className="mb-3">
+          <a href={active.url} target="_blank" rel="noreferrer" className="block">
+            <img
+              src={active.url}
+              alt={active.label}
+              className="max-h-72 w-full rounded-md border border-workshop-border object-cover"
+            />
+          </a>
+          <div className="mt-1.5 flex items-center justify-between gap-2">
+            <span className="text-[11px] text-workshop-muted">
+              <span className="mr-1 rounded border border-workshop-accent/50 px-1 py-0.5 text-[10px] text-workshop-accent">
+                {kindBadge(active.kind)}
+              </span>
+              {active.label}
+              {gallery.length > 1 ? ` · ${activeIdx + 1}/${gallery.length}` : ""}
+            </span>
+            {gallery.length > 1 && (
+              <div className="flex gap-1">
+                <button
+                  type="button"
+                  className="rounded border border-workshop-border px-2 py-0.5 text-[11px] text-workshop-muted hover:text-workshop-text"
+                  onClick={() => setActiveIdx((i) => (i - 1 + gallery.length) % gallery.length)}
+                >
+                  ←
+                </button>
+                <button
+                  type="button"
+                  className="rounded border border-workshop-border px-2 py-0.5 text-[11px] text-workshop-muted hover:text-workshop-text"
+                  onClick={() => setActiveIdx((i) => (i + 1) % gallery.length)}
+                >
+                  →
+                </button>
+              </div>
+            )}
+          </div>
+          {gallery.length > 1 && (
+            <div className="mt-2 flex gap-1.5 overflow-x-auto pb-1">
+              {gallery.map((g, idx) => (
+                <button
+                  key={`${g.url}-${idx}`}
+                  type="button"
+                  onClick={() => setActiveIdx(idx)}
+                  className={`relative shrink-0 overflow-hidden rounded border ${
+                    idx === activeIdx ? "border-workshop-accent" : "border-workshop-border opacity-70"
+                  }`}
+                  title={`${kindBadge(g.kind)}: ${g.label}`}
+                >
+                  <img src={g.url} alt={g.label} className="h-12 w-16 object-cover" loading="lazy" />
+                  <span className="absolute bottom-0 left-0 right-0 bg-black/65 px-0.5 text-center text-[8px] leading-tight text-white">
+                    {kindBadge(g.kind)}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       ) : (
         <div className="mb-3 flex max-h-48 min-h-32 items-center justify-center rounded-md border border-dashed border-workshop-border bg-black/20 p-4 text-center text-xs text-workshop-muted">
-          Kein Raumfoto verfügbar. Cursor kann keine Bilder erzeugen – bitte einen{" "}
+          Kein Raumfoto verfügbar – bitte einen{" "}
           <strong className="text-workshop-text">OpenAI-Key</strong> unter Einstellungen hinterlegen
           (Images API). Unten die technische Teileliste.
         </div>
@@ -144,8 +371,9 @@ function ConceptImageCard({
                 type="button"
                 onClick={() => onDecision({ decision: "approve" })}
                 className="rounded-md bg-workshop-accent px-3 py-1.5 text-xs font-semibold text-workshop-bg"
+                title="Gibt das Gesamt-Konzept frei (Maßgeblich = Raumsituation), nicht einzelne Thumbnails"
               >
-                Freigeben &amp; ausarbeiten
+                Gesamt-Konzept freigeben
               </button>
             </div>
           )}
@@ -259,6 +487,12 @@ export function ConversationPanel({
 
   const showConcept =
     cad.status === "escalation" && cad.escalation?.reason === "concept_approval" && cad.escalation;
+
+  const showClarification =
+    cad.status === "escalation" &&
+    cad.escalation &&
+    (cad.escalation.reason === "concept_clarification" ||
+      cad.escalation.reason === "requirements_question");
 
   const conceptArtifacts = useMemo(() => {
     const arts = (detail?.artifacts ?? []).filter((a) => a.kind === "concept_image");
@@ -414,6 +648,9 @@ export function ConversationPanel({
 
   const liveTitle = cad.escalation?.requirements_contract?.project_title ?? "Konzept-Entwurf";
   const liveImageUrl = resolveMediaUrl(cad.escalation?.concept_image_url);
+  const liveImageUrls = cad.escalation?.concept_image_urls ?? null;
+  const liveRefIds = cad.escalation?.reference_asset_ids ?? null;
+  const liveCritique = cad.escalation?.coherence_critique ?? null;
 
   return (
     <div className="relative flex h-full min-h-0 gap-2">
@@ -561,12 +798,16 @@ export function ConversationPanel({
               requirements_contract?: EscalationPayload["requirements_contract"];
               project_title?: string;
               ausarbeiten?: boolean;
+              concept_image_urls?: EscalationPayload["concept_image_urls"];
+              session_id?: string;
             };
             return (
               <div key={art.id} className="mr-4">
                 <ConceptImageCard
                   title={meta.project_title || art.label || detail?.title || "Konzept-Foto"}
                   imageUrl={resolveMediaUrl(art.url)}
+                  imageUrls={meta.concept_image_urls}
+                  sessionId={meta.session_id || art.cad_session_id}
                   parts={meta.requirements_contract?.parts}
                   onElaborate={
                     meta.ausarbeiten === false ? undefined : () => void handleElaborateConcept(art.id)
@@ -595,9 +836,39 @@ export function ConversationPanel({
               <ConceptImageCard
                 title={liveTitle}
                 imageUrl={liveImageUrl}
+                imageUrls={liveImageUrls}
+                sessionId={cad.escalation?.session_id ?? cad.sessionId}
+                referenceAssetIds={liveRefIds}
+                coherenceCritique={liveCritique}
+                panelGrades={cad.escalation?.concept_panel_grades}
+                panelAverage={cad.escalation?.concept_panel_average}
+                panelForced={cad.escalation?.concept_panel_forced}
+                panelRound={cad.escalation?.concept_panel_round}
                 parts={cad.escalation!.requirements_contract?.parts}
                 interactive
-                onDecision={(decision) => cad.resolveEscalation(decision)}
+                onDecision={(decision) => {
+                  cad.resolveEscalation(decision);
+                  // Chat neu laden – Backend speichert Anpassung/Freigabe in der Conversation
+                  if (activeConversationId) {
+                    window.setTimeout(() => invalidateConversation(qc, activeConversationId), 400);
+                    window.setTimeout(() => invalidateConversation(qc, activeConversationId), 2000);
+                  }
+                }}
+              />
+            </div>
+          )}
+
+          {showClarification && cad.escalation && (
+            <div className="mr-4">
+              <ClarificationPanel
+                escalation={cad.escalation}
+                variant="inline"
+                onDecision={(decision) => {
+                  cad.resolveEscalation(decision);
+                  if (activeConversationId) {
+                    window.setTimeout(() => invalidateConversation(qc, activeConversationId), 400);
+                  }
+                }}
               />
             </div>
           )}

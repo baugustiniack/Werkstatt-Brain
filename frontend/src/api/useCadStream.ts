@@ -140,10 +140,46 @@ export function useCadStream(): UseCadStreamResult {
             return next;
           });
           break;
-        case "escalation":
+        case "escalation": {
           setStatus("escalation");
-          setEscalation(message.escalation);
+          const raw = message.escalation as EscalationPayload | string | null | unknown[];
+          let esc: EscalationPayload;
+          if (typeof raw === "string") {
+            esc = {
+              reason: raw,
+              question: raw.includes(" ") ? raw : "Bitte Entscheidung treffen.",
+            };
+          } else if (Array.isArray(raw) && raw[0] && typeof raw[0] === "object") {
+            const first = raw[0] as EscalationPayload & { value?: EscalationPayload };
+            const inner = first.value && typeof first.value === "object" ? first.value : first;
+            esc = {
+              ...inner,
+              reason: String(inner.reason || "").trim() || "unknown",
+            };
+          } else if (raw && typeof raw === "object") {
+            const obj = raw as EscalationPayload & { value?: EscalationPayload };
+            const inner = obj.value && typeof obj.value === "object" ? obj.value : obj;
+            esc = {
+              ...inner,
+              reason: String(inner.reason || "").trim() || "unknown",
+            };
+          } else {
+            esc = { reason: "unknown", question: "Entscheidung nötig – Payload fehlte." };
+          }
+          if (
+            (esc.reason === "requirements_question" || esc.reason === "concept_clarification") &&
+            !(esc.question || "").trim()
+          ) {
+            const must = esc.coherence_critique?.must_ask_user?.[0];
+            const oq = esc.vv_requirements?.open_questions?.[0];
+            esc = {
+              ...esc,
+              question: String(must || oq || "Bitte die offene Frage beantworten."),
+            };
+          }
+          setEscalation(esc);
           break;
+        }
         case "final":
           setStatus(message.result.status === "completed" ? "completed" : "failed");
           setResult(message.result);

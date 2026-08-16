@@ -3,10 +3,12 @@
 const NODE_ORDER: { id: AgentNodeName; label: string }[] = [
   { id: "supervisor", label: "Supervisor" },
   { id: "flexible_specialist", label: "Flexible\nSpecialist" },
+  { id: "interior_architect", label: "Innen-\narchitekt" },
   { id: "custom_agent_1", label: "Leer-\nAgent 1" },
   { id: "custom_agent_2", label: "Leer-\nAgent 2" },
   { id: "vv_manager", label: "V&V\nManager" },
   { id: "concept_builder", label: "Concept\nBuilder" },
+  { id: "concept_critic", label: "Konzept-\nKritiker" },
   { id: "inventory_manager", label: "Inventory\nSpecialist" },
   { id: "fertigung_specialist", label: "Fertigungs\nSpecialist" },
   { id: "builder_3d", label: "3D\nBuilder" },

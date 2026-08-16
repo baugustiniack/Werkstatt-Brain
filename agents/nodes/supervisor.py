@@ -2,13 +2,30 @@
 
 import logging
 
+from agents.concept_panel import (
+    MAX_PANEL_ROUNDS,
+    build_revision_feedback,
+    jury_agents,
+    next_reviewer_updates,
+    panel_status_message,
+    start_panel_round,
+    summarize_round,
+)
 from agents.state import AgentState
 from agents.transcript import make_entry
 from app.services.agent_workflow_store import get_max_iterations, is_agent_enabled
 
 logger = logging.getLogger(__name__)
 
-_USER_ESCALATION_REASONS = frozenset({"concept_approval", "requirements_approval"})
+_USER_ESCALATION_REASONS = frozenset(
+    {
+        "concept_approval",
+        "concept_clarification",
+        "requirements_approval",
+        "requirements_confirm",
+        "requirements_question",
+    }
+)
 
 
 def _advance_to_next_part(state: AgentState) -> AgentState | None:
@@ -83,6 +100,20 @@ def _overlay_for_disabled_agents(state: AgentState) -> AgentState:
     # Flexible aus
     if not is_agent_enabled("flexible_specialist"):
         overlay["flexible_consulted"] = True
+    if not is_agent_enabled("interior_architect"):
+        overlay["interior_consulted"] = True
+    if not is_agent_enabled("concept_critic"):
+        overlay["concept_critiqued"] = True
+        overlay["concept_open_points_cleared"] = True
+    # Jury komplett deaktiviert → Panel als erledigt markieren (Freigabe setzt _panel_phase_updates)
+    if not jury_agents():
+        overlay["concept_critiqued"] = True
+        overlay["concept_open_points_cleared"] = True
+        if overlay.get("requirements_contract") and not overlay.get("concept_approved"):
+            overlay["concept_panel_done"] = True
+            overlay["concept_panel_passed"] = True
+            overlay["human_approval_required"] = True
+            overlay["escalation_reason"] = "concept_approval"
     # Leer-Agenten aus → als konsultiert markieren
     consulted_empty = list(overlay.get("empty_agents_consulted") or [])
     for aid in ("custom_agent_1", "custom_agent_2"):
@@ -124,10 +155,12 @@ def _overlay_for_disabled_agents(state: AgentState) -> AgentState:
             "requirements_approval",
             "requirements_question",
             "requirements_confirm",
+            "concept_clarification",
         }:
             overlay["vv_needs_alignment"] = False
             overlay["human_approval_required"] = False
             overlay["escalation_reason"] = None
+            overlay["concept_open_points_cleared"] = True
     # Fertigung aus
     if not is_agent_enabled("fertigung_specialist"):
         overlay["manufacturing_assessed"] = True
@@ -157,6 +190,192 @@ def _overlay_for_disabled_agents(state: AgentState) -> AgentState:
     return overlay
 
 
+
+def _panel_phase_updates(state: AgentState) -> AgentState | None:
+    """Startet Jury-Runden bzw. wertet abgeschlossene Runden aus (nur Supervisor)."""
+    if state.get("concept_approved") or state.get("concept_panel_done"):
+        return None
+    if not state.get("requirements_contract"):
+        return None
+    if state.get("escalation_reason") == "concept_clarification" and not state.get(
+        "concept_open_points_cleared"
+    ):
+        return None
+    if state.get("refinement_request") and (state.get("refinement_request") or {}).get(
+        "target"
+    ) == "concept_builder":
+        return None
+
+    jury = jury_agents()
+    if not jury:
+        return {
+            "concept_panel_done": True,
+            "concept_panel_passed": True,
+            "concept_panel_forced": False,
+            "concept_critiqued": True,
+            "concept_open_points_cleared": True,
+            "human_approval_required": True,
+            "escalation_reason": "concept_approval",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "[Supervisor] Keine Jury-Agenten aktiv – Konzept direkt zur Freigabe.",
+                }
+            ],
+            "agent_transcript": [
+                make_entry(
+                    "supervisor",
+                    "panel_skip_empty_jury",
+                    "Keine Jury – User-Freigabe",
+                    to_agent="human_escalation",
+                )
+            ],
+        }
+
+    queue = [str(x) for x in (state.get("concept_panel_queue") or []) if str(x).strip()]
+    grades = [g for g in (state.get("concept_panel_grades") or []) if isinstance(g, dict)]
+    round_no = int(state.get("concept_panel_round") or 0)
+    awaiting = bool(state.get("concept_panel_awaiting_rebuild"))
+
+    if awaiting and not state.get("refinement_request"):
+        started = start_panel_round(state)
+        started["concept_panel_awaiting_rebuild"] = False
+        started["concept_critiqued"] = True
+        started["concept_open_points_cleared"] = True
+        msg = (
+            f"Jury-Runde {started['concept_panel_round']}/{MAX_PANEL_ROUNDS} gestartet "
+            f"({len(jury)} Prüfer)."
+        )
+        started["messages"] = [{"role": "assistant", "content": f"[Supervisor] {msg}"}]
+        started["agent_transcript"] = [
+            make_entry(
+                "supervisor",
+                "panel_round_start",
+                msg,
+                detail={"round": started["concept_panel_round"], "jury": jury},
+                to_agent="concept_panel_reviewer",
+            )
+        ]
+        logger.info(msg)
+        return started
+
+    if round_no == 0 and not queue and not awaiting:
+        started = start_panel_round(state)
+        started["concept_critiqued"] = True
+        started["concept_open_points_cleared"] = True
+        msg = (
+            f"Jury-Runde {started['concept_panel_round']}/{MAX_PANEL_ROUNDS} gestartet "
+            f"({len(jury)} Prüfer)."
+        )
+        started["messages"] = [{"role": "assistant", "content": f"[Supervisor] {msg}"}]
+        started["agent_transcript"] = [
+            make_entry(
+                "supervisor",
+                "panel_round_start",
+                msg,
+                detail={"round": started["concept_panel_round"], "jury": jury},
+                to_agent="concept_panel_reviewer",
+            )
+        ]
+        logger.info(msg)
+        return started
+
+    if queue:
+        nxt = next_reviewer_updates(queue)
+        if nxt.get("panel_reviewer_id") and nxt.get("panel_reviewer_id") != state.get(
+            "panel_reviewer_id"
+        ):
+            return {
+                "panel_reviewer_id": nxt.get("panel_reviewer_id"),
+                "concept_panel_queue": nxt.get("concept_panel_queue"),
+            }
+        return None
+
+    if grades and round_no > 0 and not awaiting:
+        summary = summarize_round(grades)
+        avg = summary.get("average")
+        if summary.get("passed"):
+            msg = panel_status_message(summary, round_no=round_no)
+            logger.info(msg)
+            return {
+                "concept_panel_average": avg,
+                "concept_panel_passed": True,
+                "concept_panel_forced": False,
+                "concept_panel_done": True,
+                "concept_panel_awaiting_rebuild": False,
+                "human_approval_required": True,
+                "escalation_reason": "concept_approval",
+                "messages": [{"role": "assistant", "content": f"[Supervisor] {msg}"}],
+                "agent_transcript": [
+                    make_entry(
+                        "supervisor",
+                        "panel_passed",
+                        msg,
+                        detail={"round": round_no, "summary": summary, "grades": grades},
+                        to_agent="human_escalation",
+                    )
+                ],
+            }
+
+        if round_no >= MAX_PANEL_ROUNDS:
+            msg = panel_status_message(summary, round_no=round_no, forced=True)
+            logger.warning(msg)
+            return {
+                "concept_panel_average": avg,
+                "concept_panel_passed": False,
+                "concept_panel_forced": True,
+                "concept_panel_done": True,
+                "concept_panel_awaiting_rebuild": False,
+                "human_approval_required": True,
+                "escalation_reason": "concept_approval",
+                "messages": [{"role": "assistant", "content": f"[Supervisor] {msg}"}],
+                "agent_transcript": [
+                    make_entry(
+                        "supervisor",
+                        "panel_forced",
+                        msg,
+                        detail={"round": round_no, "summary": summary, "grades": grades},
+                        to_agent="human_escalation",
+                    )
+                ],
+            }
+
+        feedback = build_revision_feedback(grades, average=avg)
+        msg = panel_status_message(summary, round_no=round_no)
+        logger.info(msg)
+        return {
+            "concept_panel_average": avg,
+            "concept_panel_passed": False,
+            "concept_panel_forced": False,
+            "concept_panel_done": False,
+            "concept_panel_awaiting_rebuild": True,
+            "concept_panel_queue": [],
+            "panel_reviewer_id": None,
+            "refinement_request": {
+                "from_agent": "supervisor",
+                "target": "concept_builder",
+                "reason": "concept_feedback",
+                "feedback": feedback,
+            },
+            "concept_critiqued": False,
+            "human_approval_required": False,
+            "escalation_reason": None,
+            "messages": [{"role": "assistant", "content": f"[Supervisor] {msg}"}],
+            "agent_transcript": [
+                make_entry(
+                    "supervisor",
+                    "panel_failed_revise",
+                    msg,
+                    detail={"round": round_no, "summary": summary, "grades": grades},
+                    to_agent="concept_builder",
+                )
+            ],
+        }
+
+    return None
+
+
+
 def _compute_next_route(state: AgentState) -> str:
     """Gemeinsame Routing-Logik für Node-Preview und Conditional Edges."""
     effective = _overlay_for_disabled_agents(state)
@@ -171,10 +390,13 @@ def _compute_next_route(state: AgentState) -> str:
         target = refinement.get("target") or "concept_builder"
         allowed = {
             "flexible_specialist",
+            "interior_architect",
             "custom_agent_1",
             "custom_agent_2",
             "vv_manager",
             "concept_builder",
+            "concept_critic",
+            "concept_panel_reviewer",
             "inventory_manager",
             "fertigung_specialist",
             "montage_manager",
@@ -188,7 +410,13 @@ def _compute_next_route(state: AgentState) -> str:
         effective = {**effective, "refinement_request": None}
 
     if effective.get("vv_needs_alignment") or (
-        effective.get("human_approval_required") and reason == "requirements_approval"
+        effective.get("human_approval_required")
+        and reason
+        in {
+            "requirements_approval",
+            "requirements_confirm",
+            "requirements_question",
+        }
     ):
         if is_agent_enabled("human_escalation"):
             return "human_escalation"
@@ -203,6 +431,10 @@ def _compute_next_route(state: AgentState) -> str:
     if not effective.get("flexible_consulted") and is_agent_enabled("flexible_specialist"):
         return "flexible_specialist"
 
+    # 1a) Innenarchitekt (Raumkonzept / Ansichten / Grundriss)
+    if not effective.get("interior_consulted") and is_agent_enabled("interior_architect"):
+        return "interior_architect"
+
     # 1b) Leer-Agenten (Guidance-only, optional)
     empty_done = set(effective.get("empty_agents_consulted") or [])
     for aid in ("custom_agent_1", "custom_agent_2"):
@@ -210,24 +442,65 @@ def _compute_next_route(state: AgentState) -> str:
             return aid
 
     consulted = list(effective.get("vv_consulted_phases") or [])
-    # 2) V&V concept
+    # 2) V&V concept – nicht erneut, wenn Confirm/Interview schon läuft oder Phase done
     if "concept" not in consulted:
+        if effective.get("escalation_reason") in {
+            "requirements_approval",
+            "requirements_confirm",
+            "requirements_question",
+        }:
+            if is_agent_enabled("human_escalation"):
+                return "human_escalation"
         if is_agent_enabled("vv_manager"):
             return "vv_manager"
         consulted = list(dict.fromkeys([*consulted, "concept", "design", "manufacturing"]))
 
-    # 3) Konzept
+    # 3) Konzept-Entwurf
     if not effective.get("requirements_contract"):
         if is_agent_enabled("concept_builder"):
             return "concept_builder"
         return "END"
+
+    # 3a) Offene Konzept-Klärung (nur wenn Interrupt aktiv / Fragen offen)
+    if (
+        not effective.get("concept_approved")
+        and effective.get("escalation_reason") == "concept_clarification"
+        and not effective.get("concept_open_points_cleared")
+    ):
+        if is_agent_enabled("human_escalation"):
+            return "human_escalation"
+        if is_agent_enabled("concept_critic"):
+            return "concept_critic"
+
+    # 3b) Konzept-Jury (Konsens) vor User-Freigabe
+    if not effective.get("concept_approved") and not effective.get("concept_panel_done"):
+        if effective.get("refinement_request") and (effective.get("refinement_request") or {}).get(
+            "target"
+        ) == "concept_builder":
+            return "concept_builder" if is_agent_enabled("concept_builder") else "END"
+        queue = list(effective.get("concept_panel_queue") or [])
+        if queue:
+            return "concept_panel_reviewer"
+        # Runde beendet (grades da) oder Start nötig → Supervisor-Node setzt Updates; Route folgt
+        if effective.get("concept_panel_awaiting_rebuild"):
+            return "concept_builder" if is_agent_enabled("concept_builder") else "END"
+        if (effective.get("concept_panel_grades") or []) and int(
+            effective.get("concept_panel_round") or 0
+        ) > 0:
+            # Score wurde noch nicht in State geschrieben → human/builder nach Updates
+            if effective.get("human_approval_required") and effective.get("escalation_reason") == "concept_approval":
+                return "human_escalation" if is_agent_enabled("human_escalation") else "END"
+            if effective.get("refinement_request"):
+                return "concept_builder" if is_agent_enabled("concept_builder") else "END"
+            return "concept_panel_reviewer"
+        # Noch keine Runde / nach Rebuild → Panel starten (Supervisor schreibt Queue)
+        return "concept_panel_reviewer"
 
     if not effective.get("concept_approved"):
         if reason == "concept_approval" and is_agent_enabled("human_escalation"):
             return "human_escalation"
         if is_agent_enabled("concept_builder"):
             return "concept_builder"
-        # ohne Concept/Human: freigeben und weiter
         effective = {**effective, "concept_approved": True}
 
     # 4) V&V design
@@ -294,11 +567,14 @@ def supervisor_node(state: AgentState) -> AgentState:
     if advance_update is not None:
         return advance_update
 
-    iteration_count = state.get("iteration_count", 0) + 1
-    parts = (state.get("requirements_contract") or {}).get("parts", [])
-    idx = state.get("current_part_index", 0)
+    panel_update = _panel_phase_updates(state)
+    working: AgentState = {**state, **(panel_update or {})}
+
+    iteration_count = int(working.get("iteration_count", 0) or 0) + 1
+    parts = (working.get("requirements_contract") or {}).get("parts", [])
+    idx = working.get("current_part_index", 0)
     part_name = parts[idx].get("name") if 0 <= idx < len(parts) else None
-    next_route = _compute_next_route(state)
+    next_route = _compute_next_route(working)
 
     summary = (
         f"Iteration {iteration_count}"
@@ -308,10 +584,13 @@ def supervisor_node(state: AgentState) -> AgentState:
     )
 
     updates: AgentState = {
+        **{k: v for k, v in (panel_update or {}).items() if k not in {"messages", "agent_transcript"}},
         "iteration_count": iteration_count,
         "current_agent": "supervisor",
-        "messages": [{"role": "assistant", "content": f"[Supervisor] {summary}"}],
-        "agent_transcript": [
+        "messages": list((panel_update or {}).get("messages") or [])
+        + [{"role": "assistant", "content": f"[Supervisor] {summary}"}],
+        "agent_transcript": list((panel_update or {}).get("agent_transcript") or [])
+        + [
             make_entry(
                 "supervisor",
                 "route",
@@ -324,6 +603,7 @@ def supervisor_node(state: AgentState) -> AgentState:
                     "concept_approved": bool(state.get("concept_approved")),
                     "vv_phase": state.get("vv_phase"),
                     "flexible_consulted": bool(state.get("flexible_consulted")),
+                    "interior_consulted": bool(state.get("interior_consulted")),
                     "has_contract": bool(state.get("requirements_contract")),
                     "has_stock_context": bool(state.get("stock_and_tool_context")),
                     "manufacturing_assessed": bool(state.get("manufacturing_assessed")),

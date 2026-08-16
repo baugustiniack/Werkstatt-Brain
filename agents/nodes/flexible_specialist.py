@@ -87,19 +87,40 @@ def flexible_specialist_node(state: AgentState) -> AgentState:
     contract = state.get("requirements_contract") or {}
     guidance = get_agent_guidance("flexible_specialist")
 
+    from agents.reference_images import (
+        ensure_reference_vision_brief,
+        load_reference_images_for_llm,
+        reference_context_block,
+        resolve_reference_asset_ids,
+    )
+
+    brief, brief_updates = ensure_reference_vision_brief(state)
+    # State ggf. um Brief ergänzen, damit load_* denselben Kontext sieht
+    state_for_refs = {**state, **brief_updates} if brief_updates else state
+    ref_ids = resolve_reference_asset_ids(state_for_refs)
+    ref_images = load_reference_images_for_llm(state_for_refs, limit=4)
+    user_blob = (
+        f"Profil: {profile}\n"
+        f"Prompt: {prompt}\n"
+        f"V&V: {vv}\n"
+        f"Contract-Titel: {contract.get('project_title')}\n"
+        f"Guidance: {guidance or '(keine)'}\n"
+        f"{reference_context_block(state_for_refs)}\n"
+    )
+    if ref_images:
+        user_blob += (
+            f"\n{len(ref_images)} Referenzfoto(s) sind als Bilder angehängt – "
+            "berücksichtige Raum, Stil und vorhandene Objekte in deiner Beratung."
+        )
+
     advice: dict[str, Any]
     if is_llm_configured():
         try:
             advice = call_llm_json(
                 _ADVICE_SYSTEM,
-                (
-                    f"Profil: {profile}\n"
-                    f"Prompt: {prompt}\n"
-                    f"V&V: {vv}\n"
-                    f"Contract-Titel: {contract.get('project_title')}\n"
-                    f"Guidance: {guidance or '(keine)'}"
-                ),
+                user_blob,
                 max_tokens=1400,
+                images=ref_images or None,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Flexible Advice LLM fehlgeschlagen: %s", exc)
@@ -127,9 +148,13 @@ def flexible_specialist_node(state: AgentState) -> AgentState:
         }
 
     notes = str(advice.get("advisory_notes") or "").strip()
-    note = f"Profil „{profile.get('title')}“ – Beratung für V&V/Concept/Fertigung bereit."
+    note = (
+        f"Profil „{profile.get('title')}“ – Beratung für V&V/Concept/Fertigung bereit"
+        + (f" ({len(ref_images)} Referenzfoto(s) gesehen)" if ref_images else "")
+        + "."
+    )
 
-    return {
+    out: dict[str, Any] = {
         "flexible_specialist_profile": profile,
         "advisory_notes": notes,
         "flexible_advice": advice,
@@ -148,8 +173,15 @@ def flexible_specialist_node(state: AgentState) -> AgentState:
                     "risks": advice.get("risks"),
                     "suggestions_for_vv": advice.get("suggestions_for_vv"),
                     "suggestions_for_concept": advice.get("suggestions_for_concept"),
+                    "reference_asset_ids": ref_ids,
+                    "reference_images_sent": len(ref_images),
+                    "reference_vision_brief": truncate(brief, 500) if brief else None,
                 },
                 to_agent="supervisor",
             )
         ],
     }
+    out.update(brief_updates)
+    if ref_ids:
+        out["reference_asset_ids"] = ref_ids
+    return out

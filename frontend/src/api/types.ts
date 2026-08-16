@@ -88,12 +88,59 @@ export interface SandboxResult {
 /** Freigabe-Gates: Konzept oder V&V (Frage / Bestätigung). */
 export interface EscalationPayload {
   reason: string;
-  requirements_contract: RequirementsContract | null;
-  stock_and_tool_context: StockAndToolContext | null;
-  sandbox_result: SandboxResult | null;
-  iteration_count: number;
+  requirements_contract?: RequirementsContract | null;
+  stock_and_tool_context?: StockAndToolContext | null;
+  sandbox_result?: SandboxResult | null;
+  iteration_count?: number;
   concept_sketch_svg?: string | null;
   concept_image_url?: string | null;
+  /** Mehrere Konzept-Ansichten (Übersicht / Teile / Grundriss). */
+  concept_image_urls?: Array<{
+    url: string;
+    label?: string;
+    kind?: string;
+    part_name?: string | null;
+  }> | null;
+  /** Chat-Anhänge, die multimodal an die KI gingen */
+  reference_asset_ids?: string[] | null;
+  session_id?: string | null;
+  draft_title?: string | null;
+  draft_summary?: string | null;
+  phase?: string;
+  /** Einzelne Klärungsfrage */
+  question?: string;
+  question_index?: number;
+  question_total?: number;
+  answered_so_far?: Array<{ question?: string; answer?: string }>;
+  qa_answers?: Array<{ question?: string; answer?: string }>;
+  summary?: string | null;
+  open_questions?: string[];
+  /** Schonungslose Bild↔Text↔Konzept-Prüfung */
+  coherence_critique?: {
+    phase?: string;
+    summary?: string;
+    contradictions?: string[];
+    logic_gaps?: string[];
+    missing_information?: string[];
+    concept_issues?: string[];
+    must_ask_user?: string[];
+    assumptions_made_by_user_or_system?: string[];
+    verdict?: string;
+    severity?: string;
+  } | null;
+  /** Konzept-Jury Notenspiegel (aktuelle Runde) */
+  concept_panel_grades?: Array<{
+    agent_id?: string;
+    grade?: number;
+    verdict?: string;
+    strengths?: string[];
+    issues?: string[];
+    improvement?: string;
+  }> | null;
+  concept_panel_average?: number | null;
+  concept_panel_passed?: boolean;
+  concept_panel_forced?: boolean;
+  concept_panel_round?: number | null;
   vv_requirements?: {
     title?: string;
     phase?: string;
@@ -108,17 +155,6 @@ export interface EscalationPayload {
     acceptance_criteria?: string[];
     needs_user_alignment?: boolean;
   } | null;
-  open_questions?: string[];
-  summary?: string | null;
-  /** Einzelne V&V-Klärungsfrage */
-  question?: string;
-  question_index?: number;
-  question_total?: number;
-  answered_so_far?: Array<{ question?: string; answer?: string }>;
-  draft_title?: string | null;
-  draft_summary?: string | null;
-  phase?: string;
-  qa_answers?: Array<{ question?: string; answer?: string }>;
 }
 
 /** Entscheidung des Nutzers auf eine Freigabe-Eskalation. */
@@ -142,6 +178,12 @@ export interface CadWorkflowResult {
   iteration_count: number;
   concept_sketch_svg?: string | null;
   concept_image_url?: string | null;
+  concept_image_urls?: Array<{
+    url: string;
+    label?: string;
+    kind?: string;
+    part_name?: string | null;
+  }> | null;
   completed_parts?: CompletedPart[] | null;
   current_part_index?: number;
   total_parts?: number;
@@ -165,16 +207,26 @@ export interface AgentTranscriptEntry {
 export type AgentNodeName =
   | "supervisor"
   | "flexible_specialist"
+  | "interior_architect"
   | "custom_agent_1"
   | "custom_agent_2"
   | "vv_manager"
   | "concept_builder"
+  | "concept_critic"
+  | "concept_panel_reviewer"
   | "inventory_manager"
   | "fertigung_specialist"
   | "montage_manager"
   | "builder_3d"
   | "validator"
   | "human_escalation";
+
+export type ConceptImageView = {
+  url: string;
+  label?: string;
+  kind?: string;
+  part_name?: string | null;
+};
 
 export type CadStreamMessage =
   | { type: "node_update"; node: AgentNodeName; state: Record<string, unknown> }

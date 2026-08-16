@@ -32,6 +32,11 @@ DEFAULT_EDGES: list[dict[str, Any]] = [
     },
     {
         "from": "supervisor",
+        "to": "interior_architect",
+        "when": "noch nicht interior_consulted und Agent enabled",
+    },
+    {
+        "from": "supervisor",
         "to": "custom_agent_1",
         "when": "Leer-Agent 1 enabled und noch nicht in empty_agents_consulted",
     },
@@ -53,7 +58,12 @@ DEFAULT_EDGES: list[dict[str, Any]] = [
     {
         "from": "supervisor",
         "to": "concept_builder",
-        "when": "kein requirements_contract bzw. Konzept noch nicht freigegeben",
+        "when": "kein requirements_contract bzw. Jury fordert Überarbeitung",
+    },
+    {
+        "from": "supervisor",
+        "to": "concept_panel_reviewer",
+        "when": "Concept-Contract da, Jury-Runde läuft (concept_panel_queue)",
     },
     {
         "from": "supervisor",
@@ -91,6 +101,11 @@ DEFAULT_EDGES: list[dict[str, Any]] = [
         "when": "Profil + Advisory-Notes gesetzt",
     },
     {
+        "from": "interior_architect",
+        "to": "supervisor",
+        "when": "Raumbrief + suggested_views gesetzt",
+    },
+    {
         "from": "custom_agent_1",
         "to": "supervisor",
         "when": "Guidance ausgeführt bzw. leer übersprungen",
@@ -109,6 +124,16 @@ DEFAULT_EDGES: list[dict[str, Any]] = [
         "from": "concept_builder",
         "to": "supervisor",
         "when": "Contract/Sketch erzeugt → zurück zum Router",
+    },
+    {
+        "from": "concept_critic",
+        "to": "supervisor",
+        "when": "Kohärenz-Kritik fertig → zurück zum Router / Jury",
+    },
+    {
+        "from": "concept_panel_reviewer",
+        "to": "supervisor",
+        "when": "Jury-Note erfasst → nächster Prüfer oder Auswertung",
     },
     {
         "from": "inventory_manager",
@@ -181,6 +206,63 @@ DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
             "notes": "Optional; wenn deaktiviert, setzt der Supervisor flexible_consulted und überspringt.",
         },
     },
+    "interior_architect": {
+        "display_name": "Innenarchitekt",
+        "role": "Plant Raumkonzept, Visualisierungs-Ansichten und optionalen Grundriss vor dem Concept Builder.",
+        "responsibilities": [
+            "Erkennt Zimmer-/Raumkonzepte vs. Einzelteile",
+            "Schlägt Übersicht, Teil-Ansichten und optional Grundriss vor",
+            "Schreibt spatial_notes und advice_for_concept für Concept Builder / Bildgenerierung",
+        ],
+        "inputs": ["user_prompt", "advisory_notes"],
+        "outputs": ["interior_brief", "interior_consulted", "advisory_notes"],
+        "properties": {
+            "guidance": "",
+            "notes": "Optional; deaktiviert → Concept Builder nutzt Heuristik für Ansichten.",
+        },
+    },
+    "concept_critic": {
+        "display_name": "Konzept-Kritiker",
+        "role": "Schonungslose Prüfung des ausgearbeiteten Konzepts gegen Fotos, Prompt und V&V.",
+        "responsibilities": [
+            "Deckt Widersprüche zwischen User-Text, Referenzbildern und Concept-Contract auf",
+            "Benannte Logiklücken und fehlende Informationen",
+            "Sitzt in der Konzept-Jury (Schulnoten-Konsens)",
+        ],
+        "inputs": [
+            "user_prompt",
+            "requirements_contract",
+            "reference_vision_brief",
+            "vv_requirements",
+            "coherence_critique",
+        ],
+        "outputs": ["coherence_critique", "concept_critiqued", "escalation_reason"],
+        "properties": {
+            "guidance": "",
+            "notes": "Jury-Mitglied; Freigabe über Konzept-Konsens-Panel.",
+        },
+    },
+    "concept_panel_reviewer": {
+        "display_name": "Konzept-Jury",
+        "role": "Sequenzieller Schulnoten-Konsens der Jury-Rollen vor User-Freigabe.",
+        "responsibilities": [
+            "Bewertet das Konzept aus der Perspektive der jeweils zugewiesenen Jury-Rolle",
+            "Vergibt Note 1–6; Mangelhaft (>=5) verhindert Freigabe",
+            "Liefert Verbesserungsauflagen für den Concept Builder",
+        ],
+        "inputs": [
+            "requirements_contract",
+            "design_spec",
+            "reference_vision_brief",
+            "concept_image_urls",
+            "panel_reviewer_id",
+        ],
+        "outputs": ["concept_panel_grades", "concept_panel_queue", "panel_reviewer_id"],
+        "properties": {
+            "guidance": "",
+            "notes": "Fixed Node; Jury-Mitglieder kommen aus enabled Agents (Flex/Interior/V&V/Critic/Fertigung).",
+        },
+    },
     "custom_agent_1": {
         "display_name": "Leer-Agent 1",
         "role": "Leerer Slot – Rolle ausschließlich über manuelle Guidance.",
@@ -240,11 +322,11 @@ DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
             "gap_analysis und Annahmen dokumentieren",
         ],
         "inputs": ["user_prompt", "vv_requirements", "advisory_notes", "refinement_request"],
-        "outputs": ["requirements_contract", "concept_sketch_svg", "concept_image_url"],
+        "outputs": ["requirements_contract", "concept_sketch_svg", "concept_image_url", "concept_image_urls"],
         "properties": {
             "guidance": "",
             "prefer_conservative_dimensions": True,
-            "notes": "Zusätzliche guidance wird an den LLM-System-Prompt angehängt.",
+            "notes": "Nutzt interior_brief für Galerie (Übersicht/Teile/Grundriss), max. 5 Bilder.",
         },
     },
     "inventory_manager": {
@@ -429,7 +511,7 @@ def load_agent_profiles() -> dict[str, Any]:
                     edge_nodes.add(e.get("from"))
                     edge_nodes.add(e.get("to"))
         # Alte Topologie ohne V&V/Flexible/Fertigung/Montage → Defaults
-        if not raw_edges or "vv_manager" not in edge_nodes or "montage_manager" not in edge_nodes or "custom_agent_1" not in edge_nodes:
+        if not raw_edges or "vv_manager" not in edge_nodes or "montage_manager" not in edge_nodes or "custom_agent_1" not in edge_nodes or "concept_critic" not in edge_nodes:
             edges = deepcopy(DEFAULT_EDGES)
         else:
             edges = raw_edges
@@ -504,6 +586,12 @@ def get_enabled_agents() -> set[str]:
     except Exception as exc:  # noqa: BLE001
         logger.debug("enabled_agents aus DB nicht lesbar: %s", exc)
         enabled = set(DEFAULT_AGENTS.keys())
+    # Neu eingeführte Kern-Agenten: aktiv, bis Meta-Coach sie explizit abschaltet
+    # (persistierte Listen ohne den neuen Key würden sie sonst dauerhaft auslassen).
+    if "concept_critic" in DEFAULT_AGENTS and "concept_critic" not in enabled:
+        enabled.add("concept_critic")
+    if "concept_panel_reviewer" in DEFAULT_AGENTS and "concept_panel_reviewer" not in enabled:
+        enabled.add("concept_panel_reviewer")
     return enabled | set(FIXED_AGENT_IDS)
 
 

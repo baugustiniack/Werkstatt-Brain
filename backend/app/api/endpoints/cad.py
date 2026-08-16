@@ -51,6 +51,49 @@ SESSION_CONVERSATIONS: dict[str, str] = {}
 PAUSED_RUNS: dict[str, dict[str, Any]] = {}
 
 
+def _coerce_escalation_payload(raw: Any) -> dict[str, Any]:
+    """LangGraph-Interrupt → flaches Dict für UI (nie nur Reason-String / leeres Modal)."""
+    value = raw
+    if value is None:
+        return {"reason": "unknown", "question": "Entscheidung nötig – Payload fehlte."}
+    # Interrupt(value=...) oder verschachtelte Listen
+    for _ in range(3):
+        if hasattr(value, "value"):
+            value = getattr(value, "value")
+            continue
+        if isinstance(value, (list, tuple)) and value:
+            value = value[0]
+            continue
+        break
+    if isinstance(value, str):
+        text = value.strip()
+        return {
+            "reason": text or "unknown",
+            "question": text if text and " " in text else "Bitte Entscheidung treffen.",
+        }
+    if isinstance(value, dict):
+        out = dict(value)
+        reason = str(out.get("reason") or "").strip() or "unknown"
+        out["reason"] = reason
+        if reason in {"requirements_question", "concept_clarification"} and not str(
+            out.get("question") or ""
+        ).strip():
+            # Fallback aus nested / critique
+            q = ""
+            vv = out.get("vv_requirements") if isinstance(out.get("vv_requirements"), dict) else {}
+            oq = vv.get("open_questions") if isinstance(vv, dict) else None
+            if isinstance(oq, list) and oq:
+                q = str(oq[0] or "").strip()
+            crit = out.get("coherence_critique") if isinstance(out.get("coherence_critique"), dict) else {}
+            if not q and isinstance(crit, dict):
+                must = crit.get("must_ask_user") or []
+                if isinstance(must, list) and must:
+                    q = str(must[0] or "").strip()
+            out["question"] = q or "Bitte die offene Frage beantworten."
+        return out
+    return {"reason": "unknown", "question": f"Unerwartete Eskalation: {type(raw).__name__}"}
+
+
 def _session_conversation_map_path() -> Path:
     return Path(settings.conversations_dir) / "_session_conversations.json"
 
@@ -187,7 +230,16 @@ def _assistant_summary(values: dict[str, Any], status: str) -> str:
     lines: list[str] = []
 
     if status == "human_approval_required":
-        lines.append(f"Konzept „{title}“ liegt zur Freigabe bereit ({len(parts)} Teil(e)).")
+        revised = bool(values.get("concept_revision"))
+        prefix = "Überarbeitetes Konzept" if revised else "Konzept"
+        lines.append(f"{prefix} „{title}“ liegt zur Freigabe bereit ({len(parts)} Teil(e)).")
+        if parts:
+            names = ", ".join((p.get("name") or f"Teil {i+1}") for i, p in enumerate(parts[:12]))
+            lines.append(f"Teile: {names}")
+        if revised:
+            fb = str(values.get("last_concept_feedback") or "").strip()
+            if fb:
+                lines.append(f"Berücksichtigt deine Anpassung: {fb[:800]}")
     elif status == "completed":
         names = ", ".join((p.get("name") or f"Teil {i+1}") for i, p in enumerate(completed)) or "keine Teile"
         lines.append(f"Ausarbeitung abgeschlossen: {title} · {len(completed)} Teil(e): {names}.")
@@ -241,6 +293,105 @@ def _assistant_summary(values: dict[str, Any], status: str) -> str:
 
     return "\n\n".join(lines)
 
+
+
+def _assistant_message_is_duplicate(
+    db: Any,
+    conversation_id: uuid.UUID,
+    *,
+    session_id: str,
+    status: str,
+    content: str,
+) -> bool:
+    """Verhindert Spam gleicher Freigabe-Zeilen bei wiederholten Interrupts."""
+    from app.models.conversation import ConversationMessage
+
+    last = (
+        db.query(ConversationMessage)
+        .filter(ConversationMessage.conversation_id == conversation_id)
+        .order_by(ConversationMessage.created_at.desc())
+        .first()
+    )
+    if last is None or last.role != "assistant":
+        return False
+    if (last.cad_session_id or "") != session_id:
+        return False
+    meta = last.meta if isinstance(last.meta, dict) else {}
+    if meta.get("status") != status:
+        return False
+    return (last.content or "").strip() == content.strip()
+
+
+def _format_escalation_user_message(decision: Any, escalation: dict[str, Any] | None) -> str | None:
+    """User-sichtbarer Chat-Text für Freigabe-/Anpassungsentscheidungen."""
+    if not isinstance(decision, dict):
+        return None
+    reason = str((escalation or {}).get("reason") or "")
+    feedback = str(
+        decision.get("feedback") or decision.get("note") or decision.get("answer") or ""
+    ).strip()
+
+    if decision.get("decision") == "revise" or decision.get("approved") is False:
+        if reason == "concept_approval":
+            return (
+                f"Änderungswunsch am Konzept:\n{feedback}"
+                if feedback
+                else "Änderungswunsch am Konzept (ohne weitere Details)."
+            )
+        if reason == "requirements_approval":
+            return (
+                f"Anpassung der Anforderungen:\n{feedback}"
+                if feedback
+                else "Anpassung der Anforderungen."
+            )
+        return f"Überarbeitung angefordert:\n{feedback}" if feedback else "Überarbeitung angefordert."
+
+    if decision.get("decision") == "approve" or decision.get("approved") is True:
+        if reason == "concept_approval":
+            return "Konzept freigegeben – bitte ausarbeiten."
+        if reason == "requirements_approval":
+            return "Anforderungsliste freigegeben."
+        return "Freigabe erteilt."
+
+    if feedback:
+        question = str((escalation or {}).get("question") or (escalation or {}).get("prompt") or "").strip()
+        return f"Frage: {question}\nAntwort: {feedback}" if question else f"Antwort: {feedback}"
+    return None
+
+
+def _persist_escalation_decision(
+    session_id: str,
+    decision: Any,
+    escalation: dict[str, Any] | None,
+    values: dict[str, Any] | None = None,
+) -> None:
+    """Speichert User-Entscheidung (Anpassung/Freigabe/Antwort) dauerhaft im Chat."""
+    conversation_id = _resolve_conversation_id(session_id, values)
+    text = _format_escalation_user_message(decision, escalation)
+    if not conversation_id or not text:
+        return
+    try:
+        from app.db.postgres import SessionLocal
+        from app.services import conversation_store
+
+        db = SessionLocal()
+        try:
+            conversation_store.add_message(
+                db,
+                uuid.UUID(conversation_id),
+                "user",
+                text,
+                cad_session_id=session_id,
+                meta={
+                    "kind": "escalation_decision",
+                    "reason": (escalation or {}).get("reason"),
+                    "decision": decision if isinstance(decision, dict) else {"raw": str(decision)},
+                },
+            )
+        finally:
+            db.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Eskalations-Entscheidung nicht im Chat gespeichert: %s", exc)
 
 
 def _persist_session_transcript(session_id: str, values: dict[str, Any], *, status: str) -> None:
@@ -322,14 +473,22 @@ def _persist_session_transcript(session_id: str, values: dict[str, Any], *, stat
                     )
                 except Exception as model_exc:  # noqa: BLE001
                     logger.warning("3D-Modelle→Inventar fehlgeschlagen: %s", model_exc)
-                conversation_store.add_message(
+                summary = _assistant_summary(values, status)
+                if not _assistant_message_is_duplicate(
                     db,
                     conv_uuid,
-                    "assistant",
-                    _assistant_summary(values, status),
-                    cad_session_id=session_id,
-                    meta={"status": status},
-                )
+                    session_id=session_id,
+                    status=status,
+                    content=summary,
+                ):
+                    conversation_store.add_message(
+                        db,
+                        conv_uuid,
+                        "assistant",
+                        summary,
+                        cad_session_id=session_id,
+                        meta={"status": status, "concept_revision": bool(values.get("concept_revision"))},
+                    )
                 # Transcript immer anhängen (nie ersetzen/löschen)
                 if txt_path and txt_path.is_file():
                     from app.models.conversation import ConversationArtifact
@@ -383,7 +542,7 @@ def _build_response(session_id: str, result: dict[str, Any], *, cancelled: bool 
     interrupts = result.get("__interrupt__")
     if interrupts:
         interrupt_obj = interrupts[0]
-        interrupt_payload = getattr(interrupt_obj, "value", interrupt_obj)
+        interrupt_payload = _coerce_escalation_payload(getattr(interrupt_obj, "value", interrupt_obj))
         return CadWorkflowResponse(
             session_id=session_id,
             status="human_approval_required",
@@ -495,6 +654,18 @@ async def generate_cad(request: CadGenerateRequest) -> CadWorkflowResponse | Cad
         "human_approval_required": False,
         "messages": [{"role": "user", "content": prompt}],
     }
+    try:
+        from app.services.reference_assets import extract_reference_asset_ids
+
+        # Aktuelle Anweisung priorisieren (Anhänge stecken in request.prompt)
+        ref_ids = extract_reference_asset_ids(request.prompt, limit=8)
+        if not ref_ids:
+            ref_ids = extract_reference_asset_ids(prompt, limit=8)
+        if ref_ids:
+            initial_state["reference_asset_ids"] = ref_ids
+            logger.info("CAD-Start: %s Referenz-Asset(s) aus Chat-Anhängen", len(ref_ids))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Referenz-IDs nicht extrahierbar: %s", exc)
 
     if request.blocking:
         config = {"configurable": {"thread_id": session_id}}
@@ -589,11 +760,23 @@ async def _stream_once(
             for node_name, node_value in payload.items():
                 if node_name == "__interrupt__":
                     interrupt_obj = node_value[0] if node_value else None
-                    escalation_payload = getattr(interrupt_obj, "value", interrupt_obj)
+                    escalation_payload = _coerce_escalation_payload(
+                        getattr(interrupt_obj, "value", interrupt_obj)
+                    )
                     await websocket.send_json({"type": "escalation", "escalation": escalation_payload})
                     # Konzeptfoto früh persistieren, damit es nach Chat-Wechsel wieder da ist
                     try:
-                        snap = WORKFLOW.get_state(config).values or {}
+                        snap = dict(WORKFLOW.get_state(config).values or {})
+                        if isinstance(escalation_payload, dict):
+                            for key in (
+                                "requirements_contract",
+                                "concept_image_url",
+                                "concept_image_urls",
+                                "concept_sketch_svg",
+                                "vv_requirements",
+                            ):
+                                if escalation_payload.get(key) is not None:
+                                    snap[key] = escalation_payload[key]
                         _persist_session_transcript(session_id, snap, status="human_approval_required")
                     except Exception:  # noqa: BLE001
                         pass
@@ -1101,14 +1284,39 @@ async def elaborate_concept(request: CadElaborateConceptRequest) -> CadElaborate
 
 
 @router.get("/concept-image/{session_id}")
-async def get_concept_image(session_id: str) -> FileResponse:
-    """Liefert das generierte Konzept-Foto einer Session (OpenAI Images)."""
+async def get_concept_image(session_id: str, view: str | None = None) -> FileResponse:
+    """Liefert Konzept-Foto(s) einer Session; optional `?view=` für Galerie-Ansichten."""
     from app.services.concept_image import concept_image_path
 
-    path = concept_image_path(session_id)
+    path = concept_image_path(session_id, view=view)
     if path is None:
         raise HTTPException(status_code=404, detail="Kein Konzept-Foto für diese Session vorhanden.")
     return FileResponse(path=path, media_type="image/png", filename=path.name)
+
+
+@router.get("/concept-image/{session_id}/view/{view_key}")
+async def get_concept_image_view(session_id: str, view_key: str) -> FileResponse:
+    """Galerie-Ansicht ohne Query-String (Proxy/Cache-freundlich)."""
+    from app.services.concept_image import concept_image_path
+
+    if view_key in ("overview", "primary", "latest"):
+        path = concept_image_path(session_id, view="overview") or concept_image_path(session_id)
+    else:
+        path = concept_image_path(session_id, view=view_key)
+    if path is None:
+        raise HTTPException(status_code=404, detail=f"Keine Ansicht '{view_key}' für diese Session.")
+    return FileResponse(path=path, media_type="image/png", filename=path.name)
+
+
+@router.get("/concept-image/{session_id}/gallery")
+async def get_concept_image_gallery(session_id: str) -> dict[str, Any]:
+    """Liste aller Konzept-Ansichten einer Session (Disk + stabile URLs)."""
+    from app.services.concept_image import list_concept_gallery
+
+    items = list_concept_gallery(session_id)
+    if not items:
+        raise HTTPException(status_code=404, detail="Keine Konzept-Ansichten für diese Session.")
+    return {"session_id": session_id, "items": items}
 
 
 @router.websocket("/stream/{session_id}")
@@ -1210,6 +1418,12 @@ async def stream_cad_workflow(websocket: WebSocket, session_id: str) -> None:
                             pass
                         return
                 decision = message.get("decision")
+                try:
+                    snap = dict(WORKFLOW.get_state(config).values or {})
+                    esc = escalation_payload if isinstance(escalation_payload, dict) else None
+                    _persist_escalation_decision(session_id, decision, esc, snap)
+                except Exception:  # noqa: BLE001
+                    pass
                 graph_input = Command(resume=decision)
 
             final_state = WORKFLOW.get_state(config).values

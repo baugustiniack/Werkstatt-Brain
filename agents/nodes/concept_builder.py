@@ -60,10 +60,16 @@ _DECOMPOSITION_SYSTEM_PROMPT = """Du bist ein erfahrener Werkstatt-Planer für C
 (build123d/CNC-Fräse – KEINE Architektur-, Wand- oder Raum-Modellierung, nur einzelne, unabhängig \
 fertigbare Werkstücke aus Plattenmaterial).
 
+PRIORITÄT: Wenn der Nutzer Referenzfotos/Grundrisse mitgeschickt hat (multimodal und/oder als \
+Ground-Truth-Block), sind diese die höchste Wahrheit für Raum, vorhandene Möbel und Maße. \
+V&V-Requirements sind wichtig, dürfen den Raum aus den Fotos aber NICHT überschreiben. \
+Bei Widerspruch: Fotos/Grundriss gewinnen; Requirements nur als Ergänzung (Material, Optik, CNC).
+
 Der Nutzer beschreibt einen Wunsch, der EIN Werkstück ODER MEHRERE unabhängige Möbelstücke/Bauteile \
 umfassen kann (z.B. ein ganzes Zimmer mit mehreren Möbeln). Zerlege die Anfrage in eine Liste einzelner \
 CNC-fertigbarer Teile. Für jedes Teil: leite plausible Abmessungen/Material/Werkzeug ab, auch wenn der \
-Nutzer sie nicht explizit nennt (dokumentiere Annahmen in gap_analysis).
+Nutzer sie nicht explizit nennt (dokumentiere Annahmen in gap_analysis). Plane Teile so, dass sie in den \
+Referenzraum passen (Position/Proportionen).
 
 Antworte AUSSCHLIESSLICH mit einem einzelnen JSON-Objekt (keine Erklärung, kein Markdown) exakt in \
 diesem Format:
@@ -166,29 +172,49 @@ def _llm_decompose_request(
     *,
     vv_requirements: dict | None = None,
     advisory_notes: str | None = None,
+    images: list[tuple[bytes, str]] | None = None,
+    ground_truth: str | None = None,
 ) -> dict:
     user_message = f"Nutzeranfrage: {user_prompt}"
-    if "id=" in (user_prompt or "") or "Inventar-Referenz" in (user_prompt or "") or "Referenzdatei" in (user_prompt or ""):
+    # Fotos/Grundriss ZUERST und mit höchster Priorität
+    if ground_truth:
+        user_message += f"\n\n{ground_truth}"
+    elif (
+        "id=" in (user_prompt or "")
+        or "Inventar-Referenz" in (user_prompt or "")
+        or "Referenzdatei" in (user_prompt or "")
+        or images
+    ):
         user_message += (
-            "\n\nHinweis: Der Nutzer hat Inventar-/Referenzfotos mitgeschickt (Zeilen mit id=…). "
-            "Plane das Konzept so, dass es zu diesen konkreten Referenzräumen/-objekten passt "
-            "(Maße, Stil, vorhandene Instrumente/Möbel). Erfinde keinen völlig anderen Raum."
-        )
-    if vv_requirements:
-        user_message += (
-            "\n\nV&V-Requirements (verbindlich berücksichtigen):\n"
-            + json.dumps(vv_requirements, ensure_ascii=False)[:3500]
+            "\n\n=== GROUND TRUTH ===\n"
+            "Der Nutzer hat Inventar-/Referenzfotos mitgeschickt"
+            + (" (Bilder sind diesem Call multimodal beigefügt)." if images else " (Zeilen mit id=…).")
+            + " Diese Fotos haben Vorrang vor abgeleiteten Text-Requirements. "
+            "Plane das Konzept für GENAU diesen Raum/diese Objekte.\n"
+            "=== Ende Ground Truth ==="
         )
     if advisory_notes:
-        user_message += f"\n\nFlexible-Specialist-Advisory:\n{advisory_notes[:1200]}"
+        user_message += f"\n\nFlexible-/Raum-Hinweise (nachrangig zu Fotos):\n{advisory_notes[:1200]}"
+    if vv_requirements:
+        user_message += (
+            "\n\nV&V-Requirements (wichtig, aber NACHRANGIG zu Fotos/Grundriss – "
+            "bei Widerspruch gelten die Referenzbilder):\n"
+            + json.dumps(vv_requirements, ensure_ascii=False)[:3500]
+        )
     if feedback:
         prev_json = json.dumps({"parts": previous_parts or []}, ensure_ascii=False)
         user_message += (
             f"\n\nBisheriger Entwurf: {prev_json}\n"
             f"Nutzer-Rückmeldung zur Überarbeitung: {feedback}\n"
-            "Überarbeite den Entwurf entsprechend dieser Rückmeldung."
+            "Überarbeite den Entwurf entsprechend dieser Rückmeldung – "
+            "Referenzfotos bleiben Ground Truth."
         )
-    return call_llm_json(_decomposition_system_prompt(), user_message, max_tokens=3000)
+    return call_llm_json(
+        _decomposition_system_prompt(),
+        user_message,
+        max_tokens=3000,
+        images=images or None,
+    )
 
 
 def _decomposition_system_prompt() -> str:
@@ -205,6 +231,8 @@ def _build_concept(
     *,
     vv_requirements: dict | None = None,
     advisory_notes: str | None = None,
+    images: list[tuple[bytes, str]] | None = None,
+    ground_truth: str | None = None,
 ) -> dict:
     if is_llm_configured():
         try:
@@ -214,6 +242,8 @@ def _build_concept(
                 previous_parts,
                 vv_requirements=vv_requirements,
                 advisory_notes=advisory_notes,
+                images=images,
+                ground_truth=ground_truth,
             )
             parts = result.get("parts") or []
             if not parts:
@@ -294,9 +324,33 @@ def concept_builder_node(state: AgentState) -> AgentState:
                     )
                 ],
             }
-        # Konzept vorhanden, noch nicht freigegeben → nur Freigabe-Gate
+        # Konzept vorhanden, noch nicht freigegeben → Kritik bzw. Freigabe
         if state.get("concept_image_url") or existing_contract.get("parts"):
             title = existing_contract.get("project_title") or "Konzept"
+            if not state.get("concept_critiqued"):
+                note = f"Vorhandenes Konzept „{title}“ – Konzept-Kritik folgt."
+                return {
+                    "requirements_contract": existing_contract,
+                    "concept_sketch_svg": state.get("concept_sketch_svg"),
+                    "concept_image_url": state.get("concept_image_url"),
+                    "concept_image_urls": state.get("concept_image_urls"),
+                    "concept_approved": False,
+                    "concept_critiqued": False,
+                    "refinement_request": None,
+                    "human_approval_required": False,
+                    "escalation_reason": None,
+                    "current_agent": "concept_builder",
+                    "messages": [{"role": "assistant", "content": f"[Concept Builder] {note}"}],
+                    "agent_transcript": [
+                        make_entry(
+                            "concept_builder",
+                            "concept_reuse_critique",
+                            note,
+                            detail={"project_title": title},
+                            to_agent="concept_critic",
+                        )
+                    ],
+                }
             note = f"Vorhandenes Konzept „{title}“ – erneute Freigabe, ohne Neu-Generierung."
             return {
                 "requirements_contract": existing_contract,
@@ -358,12 +412,55 @@ def concept_builder_node(state: AgentState) -> AgentState:
 
     vv = state.get("vv_requirements") if isinstance(state.get("vv_requirements"), dict) else None
     advisory = state.get("advisory_notes") if isinstance(state.get("advisory_notes"), str) else None
+    from agents.reference_images import (
+        ensure_reference_vision_brief,
+        get_reference_vision_brief,
+        load_reference_images_for_llm,
+        reference_ground_truth_block,
+        resolve_reference_asset_ids,
+    )
+
+    vision_brief, vision_updates = ensure_reference_vision_brief(state)
+    state_for_refs = {**state, **vision_updates} if vision_updates else state
+    ref_ids = resolve_reference_asset_ids(state_for_refs)
+    ref_images = load_reference_images_for_llm(state_for_refs, limit=4)
+    # Vision-Brief in Advisory mischen, damit Dekomposition den Raum kennt
+    advisory_with_refs = advisory or ""
+    brief_text = vision_brief or get_reference_vision_brief(state_for_refs)
+    if brief_text and not reference_ground_truth_block(state_for_refs):
+        advisory_with_refs = (
+            f"{advisory_with_refs}\n\n[Referenz-Bildanalyse]\n{brief_text}".strip()
+            if advisory_with_refs
+            else f"[Referenz-Bildanalyse]\n{brief_text}"
+        )
+    ground_truth = reference_ground_truth_block(state_for_refs)
+    from agents.design_spec import (
+        apply_spec_to_contract_parts,
+        load_design_spec,
+        validate_design_spec,
+    )
+
+    design_spec = load_design_spec(state.get("design_spec"))
+    if design_spec and design_spec.frozen:
+        ground_truth = (
+            f"{design_spec.as_prompt_block()}\n\n{ground_truth}".strip()
+            if ground_truth
+            else design_spec.as_prompt_block()
+        )
+        advisory_with_refs = (
+            f"{advisory_with_refs}\n\n{design_spec.as_prompt_block()}".strip()
+            if advisory_with_refs
+            else design_spec.as_prompt_block()
+        )
+
     concept = _build_concept(
         state["user_prompt"],
         feedback_text,
         previous_parts,
         vv_requirements=vv,
-        advisory_notes=advisory,
+        advisory_notes=advisory_with_refs or None,
+        images=ref_images or None,
+        ground_truth=ground_truth or None,
     )
     sketch_svg = render_concept_sketch_svg(concept["project_title"], concept["parts"])
 
@@ -373,39 +470,81 @@ def concept_builder_node(state: AgentState) -> AgentState:
         "parts": concept["parts"],
         "gap_analysis": concept.get("gap_analysis", []),
     }
+    if design_spec and design_spec.frozen:
+        contract = apply_spec_to_contract_parts(contract, design_spec)
+        # Sketch an gebundene Maße anpassen
+        sketch_svg = render_concept_sketch_svg(contract["project_title"], contract["parts"])
+        design_spec = validate_design_spec(design_spec)
 
     concept_image_url = None
+    concept_image_urls: list[dict] = []
     try:
-        from app.services.concept_image import generate_concept_image
+        from agents.nodes.interior_architect import enrich_interior_views_from_parts
+        from app.services.concept_image import generate_concept_gallery
 
-        concept_image_url = generate_concept_image(
+        interior = state.get("interior_brief") if isinstance(state.get("interior_brief"), dict) else {}
+        if ref_ids or brief_text:
+            interior = {**interior, "need_floorplan": True, "is_room_concept": True}
+        room_plan = enrich_interior_views_from_parts(dict(interior or {}), concept["parts"])
+        logger.info(
+            "Konzept-Views geplant: %s",
+            [(v.get("kind"), v.get("label")) for v in (room_plan.get("suggested_views") or [])],
+        )
+        gallery = generate_concept_gallery(
             session_id=state.get("session_id") or "anonymous",
             project_title=concept["project_title"],
             user_prompt=state["user_prompt"],
             parts=concept["parts"],
+            views=room_plan.get("suggested_views"),
+            interior_brief={**room_plan, "reference_vision_brief": brief_text},
+            max_images=5,
+            asset_ids=ref_ids or None,
         )
+        concept_image_urls = gallery
+        concept_image_url = gallery[0]["url"] if gallery else None
+        from app.services.concept_image import ensure_gallery_urls
+
+        concept_image_urls = ensure_gallery_urls(
+            state.get("session_id") or "anonymous",
+            concept_image_urls,
+        )
+        concept_image_url = concept_image_urls[0]["url"] if concept_image_urls else concept_image_url
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Konzept-Foto übersprungen: %s", exc)
+        logger.warning("Konzept-Galerie übersprungen: %s", exc)
 
     verb = "überarbeitet" if is_concept_feedback else "erstellt"
-    photo_note = " Raumfoto erzeugt." if concept_image_url else " (kein Foto – OpenAI-Key fehlt oder Generierung fehlgeschlagen)."
+    n_imgs = len(concept_image_urls)
+    photo_note = (
+        f" {n_imgs} Konzept-Ansicht(en) erzeugt."
+        if n_imgs
+        else " (kein Foto – OpenAI-Key fehlt oder Generierung fehlgeschlagen)."
+    )
     note = (
         f"Entwurf {verb}: {concept['project_title']} ({len(concept['parts'])} Teil(e))."
-        f"{photo_note} Freigabe erforderlich."
+        f"{photo_note} → Konzept-Kritik folgt."
     )
 
     return {
         "requirements_contract": contract,
         "concept_sketch_svg": sketch_svg,
         "concept_image_url": concept_image_url,
+        "concept_image_urls": concept_image_urls,
+        "reference_asset_ids": ref_ids or state.get("reference_asset_ids"),
+        "reference_vision_brief": brief_text or state.get("reference_vision_brief"),
+        "design_spec": design_spec.to_state_dict() if design_spec else state.get("design_spec"),
         "concept_approved": False,
+        "concept_critiqued": False,
+        "concept_open_points_cleared": False,
+        "concept_revision": bool(is_concept_feedback),
+        "last_concept_feedback": feedback_text,
         "current_part_index": 0,
         "completed_parts": [],
         "refinement_request": None,
         "generated_code": None,
         "sandbox_result": None,
-        "human_approval_required": True,
-        "escalation_reason": "concept_approval",
+        # Freigabe erst nach concept_critic
+        "human_approval_required": False,
+        "escalation_reason": None,
         "current_agent": "concept_builder",
         "messages": [{"role": "assistant", "content": f"[Concept Builder] {note}"}],
         "agent_transcript": [
@@ -419,11 +558,18 @@ def concept_builder_node(state: AgentState) -> AgentState:
                     "part_names": [p.get("name") for p in concept["parts"]],
                     "gap_analysis": concept.get("gap_analysis", []),
                     "concept_image_url": concept_image_url,
+                    "concept_image_urls": concept_image_urls,
+                    "reference_asset_ids": ref_ids,
+                    "reference_images_sent": len(ref_images),
+                    "reference_vision_brief": truncate(brief_text, 500) if brief_text else None,
+                    "design_spec_frozen": bool(design_spec and design_spec.frozen),
+                    "design_spec_errors": (design_spec.validation_errors if design_spec else None),
                     "llm_used": is_llm_configured(),
                     "user_prompt": truncate(state.get("user_prompt"), 500),
                     "feedback": truncate(feedback_text, 500) if feedback_text else None,
+                    "concept_revision": bool(is_concept_feedback),
                 },
-                to_agent="human_escalation",
+                to_agent="concept_critic",
             )
         ],
     }

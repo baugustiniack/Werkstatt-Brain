@@ -6,12 +6,14 @@ import type { AssetUploadResponse, InventoryItem } from "../../api/types";
 import { useInventoryItems } from "../../hooks/useInventoryItems";
 import type { ReferenceMediaPreview } from "../modelViewer/ModelViewer";
 import { assetFileUrl, MediaFilePreview, resolvePreviewKind } from "../inventory/AssetPreview";
+import { compressImageForUpload, sleep } from "../../utils/compressImage";
 
 const SUPPORTED_EXTENSIONS = ".step,.stp,.stl,.f3d,.png,.jpg,.jpeg,.webp,.heic,.pdf";
-const MAX_ATTACHMENTS = 10;
-const MAX_FILE_BYTES = 25 * 1024 * 1024;
-const MAX_DESC_CHARS = 1200;
-const MAX_CONTEXT_CHARS = 12_000;
+/** Max. Anhänge: Bilder werden komprimiert; Prompt bekommt nur IDs (keine Vision-Texte). */
+const MAX_ATTACHMENTS = 7;
+const MAX_FILE_BYTES = 8 * 1024 * 1024;
+/** Kurze ID-Zeilen – Vision-Beschreibungen gehören in die Inventar-DB, nicht in den CAD-Prompt. */
+const MAX_CONTEXT_CHARS = 2_500;
 
 interface ChatAttachmentsProps {
   /** Kontexttext für den Agenten (nicht im Prompt-Feld anzeigen). */
@@ -36,28 +38,18 @@ function itemLabel(item: InventoryItem): string {
   return item.title?.trim() || item.file_name?.trim() || `Eintrag ${item.id.slice(0, 8)}`;
 }
 
-function itemDescription(item: InventoryItem): string {
-  const user = (item.user_notes ?? "").trim();
-  const ai = (item.ai_notes ?? item.notes ?? "").trim();
-  if (user && ai) return `Nutzer: ${user}\n\nKI: ${ai}`;
-  if (user) return user;
-  if (ai) return ai;
-  const vision = item.vision_result;
-  if (vision && typeof vision.description === "string" && vision.description.trim()) {
-    return vision.description.trim();
-  }
-  return "";
-}
-
+/**
+ * Nur Zeiger in die Inventar-DB – keine KI-Bildtexte.
+ * Vision-Beschreibungen lädt der Inventory Manager aus `vision_result` / notes.
+ * Konzept-Bilder nutzen die id=… für echte Bild-Referenzen.
+ */
 function formatInventoryAttach(item: InventoryItem): string {
   const name = itemLabel(item);
-  const desc = itemDescription(item);
-  const tags = (item.tags || []).filter((t) => !t.startsWith("conversation:")).slice(0, 6);
-  const tagLine = tags.length ? ` Tags: ${tags.join(", ")}.` : "";
-  const body = desc
-    ? desc.slice(0, 1200)
-    : "Keine Beschreibung hinterlegt – Datei/Eintrag als Referenz aus der Inventar-DB.";
-  return `[Inventar-Referenz "${name}" | id=${item.id} | typ=${item.file_type}]${tagLine}\n${body}\n(Visuelle Referenz – Konzeptfoto muss diesem Eintrag folgen.)`;
+  return `[Inventar-Referenz "${name}" | id=${item.id} | typ=${item.file_type}]`;
+}
+
+function formatUploadAttach(label: string, assetId: string, fileType: string): string {
+  return `[Referenzdatei "${label}" | id=${assetId} | typ=${fileType}]`;
 }
 
 function toPreview(item: InventoryItem): ReferenceMediaPreview | null {
@@ -176,7 +168,7 @@ export function ReferenceUpload({
     const incoming = Array.from(files);
     const room = Math.max(0, MAX_ATTACHMENTS - attached.length);
     if (room === 0) {
-      setError(`Maximal ${MAX_ATTACHMENTS} Anhänge pro Nachricht.`);
+      setError(`Maximal ${MAX_ATTACHMENTS} Anhänge pro Nachricht (Host-Schutz).`);
       return;
     }
     const batch = incoming.slice(0, room);
@@ -188,41 +180,45 @@ export function ReferenceUpload({
     abortRef.current = controller;
     const refs: AttachedRef[] = [];
     try {
-      for (const file of batch) {
+      for (let i = 0; i < batch.length; i++) {
+        const original = batch[i];
+        // Pause zwischen Uploads → weniger RAM/CPU-Spitzen (BSOD-Schutz)
+        if (i > 0) await sleep(400);
+
+        let file = original;
+        if (original.type.startsWith("image/")) {
+          file = await compressImageForUpload(original);
+        }
         if (file.size > MAX_FILE_BYTES) {
-          setError(`„${file.name}“ ist größer als 25 MB und wurde übersprungen.`);
+          setError(`„${original.name}“ ist nach Kompression noch zu groß (max. 8 MB) – übersprungen.`);
           continue;
         }
-        const localPreview = file.type.startsWith("image/") ? URL.createObjectURL(file) : null;
+
+        // Kein Object-URL vom Original (volle Handy-Fotos) – nur Server-Vorschau
         const form = new FormData();
         form.append("file", file);
-        form.append("title", `Referenz für Bauteilwunsch: ${file.name}`);
+        form.append("title", `Referenz für Bauteilwunsch: ${original.name}`);
         form.append("defer_process", "true");
-        form.append("auto_process", "true");
+        // Keine Sofort-Vision-Kette für Chat-Anhänge (RAM-Schutz); Konzept nutzt Bild-IDs
+        form.append("auto_process", "false");
         const result = await api.postForm<AssetUploadResponse>("/api/v1/inventory/upload", form, {
           signal: controller.signal,
         });
-        const description = (result.vision_result?.description as string | undefined)?.trim();
-        const shortDesc = description ? description.slice(0, MAX_DESC_CHARS) : "";
-        const context = shortDesc
-          ? `[Referenzdatei "${file.name}" | id=${result.asset_id} | typ=${result.file_type}]: ${shortDesc}\n(Visuelle Referenz – Konzeptfoto muss diesem Bild folgen.)`
-          : `[Referenzdatei "${file.name}" | id=${result.asset_id} | typ=${result.file_type}] visuelle Referenz angehängt (Beschreibung folgt im Hintergrund – Bilddatei wird für Konzept genutzt).`;
-        const kind = resolvePreviewKind(result.file_type || "other", file.name);
-        const serverPreview = kind !== "other" ? assetFileUrl(result.asset_id) : null;
-        const previewUrl = serverPreview || localPreview;
+        const context = formatUploadAttach(original.name, result.asset_id, result.file_type || "other");
+        const kind = resolvePreviewKind(result.file_type || "other", original.name);
+        const previewUrl = kind === "image" ? assetFileUrl(result.asset_id) : null;
         refs.push({
           key: `upload:${result.asset_id}`,
-          label: file.name,
+          label: original.name,
           context,
           previewUrl,
           fileType: result.file_type || "other",
           itemId: result.asset_id,
-          localObjectUrl: localPreview || undefined,
         });
-        if (previewUrl || result.asset_id) {
+        if (previewUrl) {
           onPreviewChange?.({
-            url: previewUrl || assetFileUrl(result.asset_id),
-            label: file.name,
+            url: previewUrl,
+            label: original.name,
             kind,
             fileType: result.file_type,
             itemId: result.asset_id,
@@ -265,7 +261,7 @@ export function ReferenceUpload({
     if (selectedItems.length === 0) return;
     const room = Math.max(0, MAX_ATTACHMENTS - attached.length);
     if (room === 0) {
-      setError(`Maximal ${MAX_ATTACHMENTS} Anhänge pro Nachricht.`);
+      setError(`Maximal ${MAX_ATTACHMENTS} Anhänge pro Nachricht (Host-Schutz).`);
       return;
     }
     const pick = selectedItems.slice(0, room);
@@ -471,10 +467,12 @@ export function ReferenceUpload({
   return (
     <div className="flex flex-col gap-1.5">
       <div className="flex items-center justify-between gap-2">
-        <label className="text-xs font-semibold text-workshop-muted">Referenzen (optional)</label>
+        <label className="text-xs font-semibold text-workshop-muted">
+          Referenzen (optional, max. {MAX_ATTACHMENTS}, Fotos werden komprimiert)
+        </label>
         {attached.length > 0 && (
           <span className="text-[10px] text-workshop-muted">
-            {attached.length} angehängt · Beschreibung unsichtbar mitgeschickt
+            {attached.length} angehängt · nur IDs im Prompt (Beschreibungen bleiben in der Inventar-DB)
           </span>
         )}
       </div>

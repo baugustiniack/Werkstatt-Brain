@@ -85,9 +85,14 @@ function App() {
     setSelectedPartIndex(Math.max(parts.length - 1, 0));
   }, [parts.length]);
 
-  // Konzept-Freigabe läuft inline im Chat; Requirements & sonstige Gates als Dialog
+  // Konzept-Freigabe + Klärungsfragen laufen inline im Chat; Rest als Dialog
   const showGenericEscalation =
-    cad.escalation && cad.escalation.reason !== "concept_approval" ? cad.escalation : null;
+    cad.escalation &&
+    cad.escalation.reason !== "concept_approval" &&
+    cad.escalation.reason !== "concept_clarification" &&
+    cad.escalation.reason !== "requirements_question"
+      ? cad.escalation
+      : null;
 
   if (hash.startsWith("#/mobile-upload")) {
     return <MobilePhotoUploadPage />;

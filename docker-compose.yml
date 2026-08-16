@@ -41,9 +41,10 @@ services:
         condition: service_started
     networks:
       - werkstatt-net
-    # 1.5g: Vision-Downscale + PDF/STL-Kontext brauchen Headroom ohne Host-OOM
-    mem_limit: 1536m
-    cpus: 2.0
+    # Host-Schutz (Windows): Container darf OOM gehen, bevor der Host BSOD macht.
+    # Chat+Bilder: Downscale/Vision laufen im Limit; API-OOM > Host-Freeze.
+    mem_limit: 1024m
+    cpus: 1.5
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -134,8 +135,8 @@ services:
       - api
     networks:
       - werkstatt-net
-    mem_limit: 768m
-    cpus: 1.5
+    mem_limit: 512m
+    cpus: 1.0
 
   # ── Sandbox-Image (nur zum Bauen; Instanzen werden ephemer per
   #    app.services.sandbox_runner über den Docker-Socket gestartet) ────────
