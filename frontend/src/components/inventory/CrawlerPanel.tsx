@@ -6,7 +6,8 @@ import type { AssetUploadResponse } from "../../api/types";
 import { useTriggerCrawlerScan } from "../../hooks/useCrawlerQueue";
 
 const SUPPORTED_EXTENSIONS: string[] | null = null; // null = alle Formate
-const UPLOAD_CONCURRENCY = 3;
+const UPLOAD_CONCURRENCY = 1; // 1 = stabil (Vision/RAM); parallel Upload = OOM-Risiko
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
 
 interface UploadProgress {
   total: number;
@@ -37,8 +38,17 @@ async function uploadFilesWithConcurrency(
       const file = files[cursor];
       cursor += 1;
       try {
+        if (file.size > MAX_FILE_BYTES) {
+          onProgress((prev) => {
+            const base = prev ?? EMPTY_PROGRESS;
+            return { ...base, done: base.done + 1, errors: base.errors + 1 };
+          });
+          continue;
+        }
         const form = new FormData();
         form.append("file", file);
+        form.append("defer_process", "true");
+        form.append("auto_process", "true");
         const result = await api.postForm<AssetUploadResponse>("/api/v1/inventory/upload", form, { signal });
         onProgress((prev) => {
           const base = prev ?? EMPTY_PROGRESS;

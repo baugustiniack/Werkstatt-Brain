@@ -1,7 +1,7 @@
 """Inventory-, Upload- & Crawler-Endpunkte (SPEC Kap. 2.3, 5.3).
 
 Enthält:
-    - `GET/POST/PATCH /api/v1/inventory/items`     – unstrukturierte Asset-Bibliothek (Dateien + manuelle Einträge)
+    - `GET/POST/PATCH/DELETE /api/v1/inventory/items` – unstrukturierte Asset-Bibliothek (Dateien + manuelle Einträge)
     - `POST /api/v1/inventory/items/{id}/process`  – KI-Strukturierung eines einzelnen Eintrags anstoßen
     - `POST /api/v1/inventory/process-pending`     – Batch-KI-Strukturierung ausstehender Einträge
     - `GET /api/v1/inventory/items/{id}/file`      – Rohdatei eines Eintrags (Thumbnails)
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import mimetypes
+import os
 import uuid
 from dataclasses import asdict
 from decimal import Decimal
@@ -188,10 +189,26 @@ async def upload_asset(
 ) -> AssetUploadResponse:
     """Nimmt eine Datei entgegen und legt sie in der Inventar-DB an.
 
-    `defer_process=true` (Handy): speichert sofort, Vision läuft im Hintergrund –
-    verhindert Timeouts bei großen Fotos / langsamer Vision.
+    `defer_process=true` (Handy/Chat): speichert sofort, Vision läuft im Hintergrund –
+    verhindert Timeouts und RAM-Spitzen bei großen Fotos.
     """
-    content = await file.read()
+    max_bytes = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+    sync_vision_max = int(os.getenv("SYNC_VISION_MAX_BYTES", str(2 * 1024 * 1024)))
+
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Datei zu groß (max. {max_bytes // (1024 * 1024)} MB). Bitte verkleinern.",
+            )
+        chunks.append(chunk)
+    content = b"".join(chunks)
     if not content:
         raise HTTPException(status_code=400, detail="Leere Datei hochgeladen.")
 
@@ -202,7 +219,10 @@ async def upload_asset(
         ext = "jpg" if subtype in ("jpeg", "jpg") else subtype.split("+")[0]
         filename = f"{filename}.{ext}"
 
-    if defer_process:
+    # Große Dateien nie synchron visionen (OOM-Schutz im 1g-Container)
+    use_defer = defer_process or total > sync_vision_max
+
+    if use_defer:
         from functools import partial
 
         saved = await run_in_threadpool(
@@ -572,13 +592,8 @@ def list_inventory_items(
                 raise HTTPException(status_code=400, detail=f"Ungültiger source-Filter '{source}'.") from exc
 
         items = query.order_by(UnprocessedAsset.discovered_at.desc()).limit(limit).all()
-        # Einmalige Korrektur bekannter Fehlklassifizierungen (z.B. Konzept→material)
-        for asset in items:
-            try:
-                vision_ingest.repair_misclassified_asset(db, asset)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Klassifikations-Repair fehlgeschlagen für %s: %s", asset.id, exc)
-            db.refresh(asset)
+        # Kein Repair mehr bei jedem List-Poll (Frontend alle ~20s) – das lastete
+        # DB/CPU unnötig. Repair läuft bei Bedarf über process/ingest.
         pending_count = db.query(UnprocessedAsset).filter(UnprocessedAsset.status == AssetStatus.PENDING).count()
         total_count = db.query(UnprocessedAsset).count()
         return InventoryItemListResponse(
@@ -660,6 +675,43 @@ def update_inventory_item(item_id: str, request: InventoryItemUpdateRequest) -> 
         db.commit()
         db.refresh(asset)
         return _asset_to_item_response(asset)
+    finally:
+        db.close()
+
+
+@router.delete("/inventory/items/{item_id}")
+def delete_inventory_item(item_id: str) -> dict[str, str]:
+    """Löscht einen Inventar-Eintrag inkl. zugehöriger Upload-Datei (falls vorhanden)."""
+    db = SessionLocal()
+    try:
+        try:
+            asset_uuid = uuid.UUID(item_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Ungültige ID '{item_id}'.") from exc
+
+        asset = db.get(UnprocessedAsset, asset_uuid)
+        if asset is None:
+            raise HTTPException(status_code=404, detail=f"Eintrag '{item_id}' nicht gefunden.")
+
+        file_path = asset.file_path
+        db.delete(asset)
+        db.commit()
+
+        if file_path:
+            try:
+                path = Path(file_path)
+                uploads_root = Path(settings.uploads_dir).resolve()
+                resolved = path.resolve()
+                # Nur Dateien unter uploads_dir entfernen (keine Crawler-Pfade außerhalb)
+                if resolved.is_file() and (
+                    resolved == uploads_root or uploads_root in resolved.parents
+                ):
+                    resolved.unlink(missing_ok=True)
+                    logger.info("Upload-Datei gelöscht: %s", resolved)
+            except OSError as exc:
+                logger.warning("Datei zu Asset %s konnte nicht gelöscht werden: %s", item_id, exc)
+
+        return {"status": "deleted", "id": item_id}
     finally:
         db.close()
 

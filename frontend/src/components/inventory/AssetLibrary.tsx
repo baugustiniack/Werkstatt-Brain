@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { InventoryItem } from "../../api/types";
 import {
   useCreateManualEntry,
+  useDeleteInventoryItem,
   useInventoryItems,
   useKnowledgeGraphStats,
   useProcessInventoryItem,
@@ -107,11 +108,13 @@ function AssetDetail({
 }) {
   const update = useUpdateInventoryItem();
   const process = useProcessInventoryItem();
+  const remove = useDeleteInventoryItem();
   const { data: keyStatus } = useApiKeyStatus();
   const [title, setTitle] = useState(item.title ?? "");
   const [userNotes, setUserNotes] = useState(userNotesOf(item));
   const [aiNotes, setAiNotes] = useState(aiNotesOf(item));
   const [showMeta, setShowMeta] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const fileUrl = item.file_path ? assetFileUrl(item.id) : null;
   const dirty =
     title.trim() !== (item.title ?? "").trim() ||
@@ -126,6 +129,7 @@ function AssetDetail({
     setUserNotes(userNotesOf(item));
     setAiNotes(aiNotesOf(item));
     setShowMeta(false);
+    setConfirmDelete(false);
   }, [item.id, item.title, item.user_notes, item.ai_notes, item.notes, item.vision_result]);
 
   const handleSave = () => {
@@ -134,6 +138,12 @@ function AssetDetail({
       title: title.trim() || undefined,
       user_notes: userNotes,
       ai_notes: aiNotes,
+    });
+  };
+
+  const handleDelete = () => {
+    remove.mutate(item.id, {
+      onSuccess: () => onClose(),
     });
   };
 
@@ -261,9 +271,44 @@ function AssetDetail({
             Datei öffnen
           </a>
         )}
+        {!confirmDelete ? (
+          <button
+            type="button"
+            onClick={() => setConfirmDelete(true)}
+            disabled={remove.isPending}
+            className="ml-auto rounded-md border border-workshop-danger/50 px-3 py-1.5 text-xs font-semibold text-workshop-danger hover:bg-workshop-danger/10 disabled:opacity-40"
+          >
+            Löschen
+          </button>
+        ) : (
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <span className="text-[11px] text-workshop-warning">Wirklich löschen?</span>
+            <button
+              type="button"
+              onClick={handleDelete}
+              disabled={remove.isPending}
+              className="rounded-md bg-workshop-danger px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-40"
+            >
+              {remove.isPending ? "Lösche…" : "Ja, löschen"}
+            </button>
+            <button
+              type="button"
+              onClick={() => setConfirmDelete(false)}
+              disabled={remove.isPending}
+              className="rounded-md border border-workshop-border px-3 py-1.5 text-xs text-workshop-text hover:bg-workshop-bg"
+            >
+              Abbrechen
+            </button>
+          </div>
+        )}
       </div>
 
       {update.isSuccess && <p className="text-[11px] text-workshop-success">Gespeichert.</p>}
+      {remove.isError && (
+        <p className="text-xs text-workshop-danger">
+          {remove.error instanceof Error ? remove.error.message : "Löschen fehlgeschlagen"}
+        </p>
+      )}
 
       <button
         type="button"

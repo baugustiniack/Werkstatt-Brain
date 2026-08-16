@@ -14,7 +14,9 @@ import json
 import logging
 import mimetypes
 import re
+import threading
 import uuid
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Literal
 
@@ -397,6 +399,45 @@ def is_vision_configured() -> bool:
     return bool(settings_store.resolve_openai_api_key())
 
 
+# Eine Vision-Analyse gleichzeitig – verhindert OOM im 1g-API-Container
+_VISION_SEM = threading.Semaphore(1)
+_VISION_MAX_SIDE = 1600
+_VISION_MAX_BYTES = 1_800_000
+
+
+def _prepare_vision_image(path: Path) -> tuple[bytes, str]:
+    """Lädt Bild und verkleinert es für Vision (weniger RAM/Base64)."""
+    media_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+    raw = path.read_bytes()
+    if len(raw) <= _VISION_MAX_BYTES and media_type in ("image/jpeg", "image/png", "image/webp"):
+        # Kleine Dateien: trotzdem max. Kantenlänge prüfen wenn Pillow da ist
+        pass
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(raw)) as img:
+            img = img.convert("RGB") if img.mode not in ("RGB", "L") else img
+            if img.mode == "L":
+                img = img.convert("RGB")
+            w, h = img.size
+            scale = min(1.0, _VISION_MAX_SIDE / max(w, h, 1))
+            if scale < 1.0:
+                img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS)
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=82, optimize=True)
+            out = buf.getvalue()
+            if len(out) > _VISION_MAX_BYTES:
+                buf = BytesIO()
+                img.save(buf, format="JPEG", quality=65, optimize=True)
+                out = buf.getvalue()
+            return out, "image/jpeg"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Bild-Downscale fehlgeschlagen (%s): %s – Original (max %s Bytes)", path.name, exc, _VISION_MAX_BYTES)
+        if len(raw) > _VISION_MAX_BYTES:
+            raise ValueError(f"Bild zu groß für Vision ohne Downscale ({len(raw)} Bytes)") from exc
+        return raw, media_type
+
+
 def analyze_asset_image(
     file_path: str,
     *,
@@ -405,40 +446,51 @@ def analyze_asset_image(
 ) -> VisionIngestResult:
     """Analysiert ein Bild ausschließlich per OpenAI Vision."""
     path = Path(file_path)
-    media_type = mimetypes.guess_type(path.name)[0] or "image/png"
-    image_bytes = path.read_bytes()
 
     if not settings_store.resolve_openai_api_key():
         return VisionIngestResult(**_heuristic_fallback(file_path))
 
-    last_error: Exception | None = None
-    for attempt in range(2):
+    with _VISION_SEM:
         try:
-            raw_result = _call_openai_vision(
-                image_bytes,
-                media_type,
-                hint=classification_hint,
-                user_notes=user_notes,
-            )
-            return VisionIngestResult(**raw_result)
+            image_bytes, media_type = _prepare_vision_image(path)
         except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            logger.warning(
-                "OpenAI-Vision-Analyse fehlgeschlagen für %s (Versuch %s): %s",
-                file_path,
-                attempt + 1,
-                exc,
+            logger.warning("Vision-Bildvorbereitung fehlgeschlagen für %s: %s", file_path, exc)
+            return VisionIngestResult(
+                category="unknown",
+                description=(
+                    f"Bild '{path.name}' konnte nicht für die KI-Analyse vorbereitet werden ({exc}). "
+                    "Bitte kleinere Datei verwenden oder Beschreibung manuell ergänzen."
+                ),
+                tags=["vision_error", "image_too_large"],
             )
 
-    # Key ist da, aber Call/JSON unbrauchbar – nicht still den alten Stub behalten
-    return VisionIngestResult(
-        category="unknown",
-        description=(
-            f"OpenAI-Bildanalyse für '{path.name}' fehlgeschlagen "
-            f"({last_error}). Bitte erneut „KI beschreiben“ versuchen oder die Beschreibung manuell ergänzen."
-        ),
-        tags=["vision_error"],
-    )
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                raw_result = _call_openai_vision(
+                    image_bytes,
+                    media_type,
+                    hint=classification_hint,
+                    user_notes=user_notes,
+                )
+                return VisionIngestResult(**raw_result)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning(
+                    "OpenAI-Vision-Analyse fehlgeschlagen für %s (Versuch %s): %s",
+                    file_path,
+                    attempt + 1,
+                    exc,
+                )
+
+        return VisionIngestResult(
+            category="unknown",
+            description=(
+                f"OpenAI-Bildanalyse für '{path.name}' fehlgeschlagen "
+                f"({last_error}). Bitte erneut „KI beschreiben“ versuchen oder die Beschreibung manuell ergänzen."
+            ),
+            tags=["vision_error"],
+        )
 
 def asset_needs_ai_rescan(asset: UnprocessedAsset) -> bool:
     """True für pending/failed oder Stub-/Heuristik-Beschreibungen ohne echte KI."""

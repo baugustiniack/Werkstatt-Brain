@@ -11,56 +11,107 @@ import {
   rankLanIp,
 } from "../../utils/lanDiscovery";
 
-/** Schlanke Kamera-Upload-Seite fürs Handy (#/mobile-upload). */
+/** Schlanke Kamera-/Datei-Upload-Seite fürs Handy (#/mobile-upload). */
 export function MobilePhotoUploadPage() {
   const cameraRef = useRef<HTMLInputElement>(null);
+  const galleryRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
-  const [result, setResult] = useState<AssetUploadResponse | null>(null);
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
+  const [results, setResults] = useState<
+    { name: string; ok: boolean; duplicate?: boolean; assetId?: string; error?: string }[]
+  >([]);
   const [error, setError] = useState<string | null>(null);
   const [title, setTitle] = useState("");
   const [apiOk, setApiOk] = useState<boolean | null>(null);
 
   useEffect(() => {
-    document.title = "Werkstatt-Brain · Foto";
+    document.title = "Werkstatt-Brain · Upload";
+    // PWA/Service-Worker: alte Bundle-Caches freigeben (sonst bleibt die Single-Upload-UI)
+    if ("serviceWorker" in navigator) {
+      void navigator.serviceWorker.getRegistrations().then((regs) => {
+        for (const reg of regs) {
+          void reg.update();
+          if (reg.waiting) void reg.waiting.postMessage({ type: "SKIP_WAITING" });
+        }
+      });
+    }
     void api
       .get<{ status: string }>("/health")
       .then(() => setApiOk(true))
       .catch(() => setApiOk(false));
   }, []);
 
-  const handleFiles = async (files: FileList | null) => {
-    const file = files?.[0];
-    if (!file) return;
-    setError(null);
-    setResult(null);
-    setUploading(true);
+  const uploadOne = async (file: File, index: number, total: number): Promise<{
+    name: string;
+    ok: boolean;
+    duplicate?: boolean;
+    assetId?: string;
+    error?: string;
+  }> => {
+    const form = new FormData();
+    form.append("file", file, file.name || `handy-datei-${Date.now()}-${index}`);
+    if (title.trim()) {
+      form.append("title", total > 1 ? `${title.trim()} (${index + 1}/${total})` : title.trim());
+    }
+    form.append("defer_process", "true");
+    form.append("auto_process", "true");
     try {
-      const form = new FormData();
-      form.append("file", file, file.name || `handy-foto-${Date.now()}.jpg`);
-      if (title.trim()) form.append("title", title.trim());
-      // Sofort speichern; Vision im Hintergrund – sonst Timeout bei großen Handy-Fotos
-      form.append("defer_process", "true");
-      form.append("auto_process", "true");
       const data = await api.postForm<AssetUploadResponse>("/api/v1/inventory/upload", form);
-      setResult(data);
-      setTitle("");
+      return {
+        name: file.name || `Datei ${index + 1}`,
+        ok: true,
+        duplicate: data.duplicate,
+        assetId: data.asset_id,
+      };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Upload fehlgeschlagen";
-      setError(
-        `${msg} (API: ${apiBaseUrl() || window.location.origin}). Seite neu laden und erneut versuchen.`,
-      );
-    } finally {
-      setUploading(false);
-      if (cameraRef.current) cameraRef.current.value = "";
+      return {
+        name: file.name || `Datei ${index + 1}`,
+        ok: false,
+        error: err instanceof Error ? err.message : "Upload fehlgeschlagen",
+      };
     }
   };
+
+  const handleFiles = async (files: FileList | null) => {
+    const list = files ? Array.from(files) : [];
+    if (list.length === 0) return;
+    setError(null);
+    setResults([]);
+    setUploading(true);
+    setProgress({ done: 0, total: list.length });
+
+    const next: typeof results = [];
+    // Sequentiell – schont Handy-Netz und PC (kein Parallel-Burst)
+    for (let i = 0; i < list.length; i++) {
+      const row = await uploadOne(list[i], i, list.length);
+      next.push(row);
+      setResults([...next]);
+      setProgress({ done: i + 1, total: list.length });
+    }
+
+    const failed = next.filter((r) => !r.ok).length;
+    if (failed > 0 && failed === next.length) {
+      setError(
+        `Alle Uploads fehlgeschlagen (API: ${apiBaseUrl() || window.location.origin}). Seite neu laden und erneut versuchen.`,
+      );
+    } else if (failed === 0) {
+      setTitle("");
+    }
+    setUploading(false);
+    setProgress(null);
+    if (cameraRef.current) cameraRef.current.value = "";
+    if (galleryRef.current) galleryRef.current.value = "";
+  };
+
+  const okCount = results.filter((r) => r.ok).length;
+  const failCount = results.filter((r) => !r.ok).length;
 
   return (
     <div className="mx-auto flex min-h-dvh max-w-md flex-col gap-4 bg-workshop-bg p-4 text-workshop-text">
       <header>
-        <h1 className="text-lg font-semibold text-workshop-accent">Inventar-Foto</h1>
+        <h1 className="text-lg font-semibold text-workshop-accent">Inventar-Upload</h1>
         <p className="mt-1 text-sm text-workshop-muted">
-          Foto aufnehmen – landet direkt in der Inventory-DB (Vision-Scan folgt automatisch).
+          Foto oder mehrere Dateien – landen in der Inventory-DB (KI-Beschreibung folgt automatisch).
         </p>
         <p className="mt-2 font-mono text-[11px] text-workshop-muted">
           API: {apiBaseUrl() || window.location.origin}{" "}
@@ -74,48 +125,92 @@ export function MobilePhotoUploadPage() {
       </header>
 
       <label className="flex flex-col gap-1 text-sm">
-        <span className="text-workshop-muted">Titel (optional)</span>
+        <span className="text-workshop-muted">Titel-Basis (optional, bei mehreren mit Nummer)</span>
         <input
           value={title}
           onChange={(e) => setTitle(e.target.value)}
-          placeholder="z. B. Fräser 6mm / Reststück Buche"
+          placeholder="z. B. Fräser / Reststücke Buche"
           className="rounded-md border border-workshop-border bg-workshop-panel px-3 py-2"
         />
       </label>
 
-      <button
-        type="button"
-        disabled={uploading}
-        onClick={() => cameraRef.current?.click()}
-        className="rounded-lg bg-workshop-accent px-4 py-4 text-base font-semibold text-workshop-bg disabled:opacity-40"
+      {/* Mehrfach zuerst (ohne capture) – sonst öffnet iOS oft nur die Kamera */}
+      <label
+        className={`relative block overflow-hidden rounded-lg border-2 border-dashed border-workshop-accent bg-workshop-accent/10 px-4 py-5 text-center text-base font-semibold text-workshop-accent ${
+          uploading ? "pointer-events-none opacity-40" : ""
+        }`}
       >
-        {uploading ? "Lädt hoch…" : "Kamera öffnen & hochladen"}
-      </button>
-      <input
-        ref={cameraRef}
-        type="file"
-        accept="image/*"
-        capture="environment"
-        className="hidden"
-        onChange={(e) => void handleFiles(e.target.files)}
-      />
-
-      <label className="block">
-        <span className="mb-1 block text-sm text-workshop-muted">Oder aus Galerie wählen</span>
+        {uploading && progress
+          ? `Lädt ${progress.done}/${progress.total}…`
+          : "Mehrere Fotos / Dateien wählen"}
+        <span className="mt-1 block text-xs font-normal text-workshop-muted">
+          Galerie öffnen → mehrere antippen → „Auswählen“ / „Öffnen“
+        </span>
         <input
+          ref={galleryRef}
           type="file"
-          accept="image/*"
+          accept="image/*,.heic,.heif,.pdf,.stl,.step,.stp,.png,.jpg,.jpeg,.webp"
+          multiple
           disabled={uploading}
+          className="absolute inset-0 z-10 cursor-pointer opacity-0"
           onChange={(e) => void handleFiles(e.target.files)}
-          className="w-full text-sm text-workshop-muted file:mr-3 file:rounded-md file:border-0 file:bg-workshop-panel file:px-3 file:py-2 file:text-workshop-text"
         />
       </label>
 
-      {result && (
-        <div className="rounded-md border border-workshop-success/40 bg-workshop-success/10 p-3 text-sm">
-          {result.duplicate ? "Duplikat – schon in der DB" : "In Inventar-DB gespeichert"} – Status:{" "}
-          {result.status}
-          <div className="mt-1 text-[11px] text-workshop-muted">ID: {result.asset_id}</div>
+      <label
+        className={`relative block overflow-hidden rounded-lg bg-workshop-panel px-4 py-3 text-center text-sm font-semibold text-workshop-text ${
+          uploading ? "pointer-events-none opacity-40" : ""
+        }`}
+      >
+        Nur Kamera (1 Foto)
+        <input
+          ref={cameraRef}
+          type="file"
+          accept="image/*"
+          capture="environment"
+          disabled={uploading}
+          className="absolute inset-0 z-10 cursor-pointer opacity-0"
+          onChange={(e) => void handleFiles(e.target.files)}
+        />
+      </label>
+
+      <p className="text-center text-[11px] text-workshop-muted">
+        Kennzeichen: „Mehrere Fotos / Dateien wählen“ · sonst QR neu scannen (v=multi3)
+      </p>
+
+      {progress && (
+        <div className="rounded-md border border-workshop-border bg-workshop-panel/50 p-3 text-sm">
+          Hochladen: {progress.done} / {progress.total}
+          <div className="mt-2 h-1.5 overflow-hidden rounded bg-workshop-border">
+            <div
+              className="h-full bg-workshop-accent transition-all"
+              style={{ width: `${Math.round((progress.done / progress.total) * 100)}%` }}
+            />
+          </div>
+        </div>
+      )}
+
+      {results.length > 0 && (
+        <div
+          className={`rounded-md border p-3 text-sm ${
+            failCount === 0
+              ? "border-workshop-success/40 bg-workshop-success/10"
+              : "border-workshop-warning/40 bg-workshop-warning/10"
+          }`}
+        >
+          <div className="font-semibold">
+            {okCount} gespeichert
+            {failCount > 0 ? ` · ${failCount} fehlgeschlagen` : ""}
+          </div>
+          <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto text-[11px] text-workshop-muted">
+            {results.map((r) => (
+              <li key={`${r.name}-${r.assetId ?? r.error}`}>
+                {r.ok
+                  ? `✓ ${r.name}${r.duplicate ? " (Duplikat)" : ""}`
+                  : `✗ ${r.name}: ${r.error}`}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
       {error && (
@@ -269,7 +364,7 @@ export function InventoryMobileQr() {
           </div>
         )}
         <div className="min-w-0 flex-1 space-y-2">
-          <p className="text-xs text-workshop-muted">Gleich WLAN · QR scannen · Foto hochladen</p>
+          <p className="text-xs text-workshop-muted">Gleich WLAN · QR · Foto oder mehrere Dateien</p>
           <code className="block truncate rounded border border-workshop-border bg-black/30 px-2 py-1.5 font-mono text-[11px] text-workshop-accent" title={phoneUrl}>
             {phoneUrl}
           </code>

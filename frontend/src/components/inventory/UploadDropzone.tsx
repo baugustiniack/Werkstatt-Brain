@@ -30,8 +30,15 @@ export function UploadDropzone() {
     const controller = new AbortController();
     abortRef.current = controller;
     try {
+      if (file.size > 25 * 1024 * 1024) {
+        setError("Datei zu groß (max. 25 MB).");
+        setIsUploading(false);
+        return;
+      }
       const form = new FormData();
       form.append("file", file);
+      form.append("defer_process", "true");
+      form.append("auto_process", "true");
       const data = await api.postForm<AssetUploadResponse>("/api/v1/inventory/upload", form, {
         signal: controller.signal,
       });

@@ -41,9 +41,8 @@ def _set_execution_state(flags: int) -> None:
 
 
 def _apply_awake() -> None:
-    # SYSTEM_REQUIRED: Idle-Timer zurücksetzen (kein Ruhezustand)
-    # AWAYMODE: erlaubt Media-/Away-Mode statt echtem Sleep (falls konfiguriert)
-    _set_execution_state(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_AWAYMODE_REQUIRED)
+    # Nur SYSTEM_REQUIRED (kein Away-Mode) – weniger Eingriffe in Windows-Energieverwaltung
+    _set_execution_state(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
 
 
 def _clear_awake() -> None:

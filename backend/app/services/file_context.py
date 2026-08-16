@@ -32,7 +32,7 @@ def _extract_pdf_text(path: Path, *, max_chars: int = _MAX_EXTRACT_CHARS) -> str
         reader = PdfReader(str(path))
         chunks: list[str] = []
         total = 0
-        for page in reader.pages[:40]:
+        for page in reader.pages[:20]:
             page_text = (page.extract_text() or "").strip()
             if not page_text:
                 continue
@@ -49,24 +49,26 @@ def _extract_pdf_text(path: Path, *, max_chars: int = _MAX_EXTRACT_CHARS) -> str
 
 
 def _stl_summary(path: Path) -> str:
-    head = path.read_bytes()[:200]
-    if head.lstrip().lower().startswith(b"solid"):
-        text = _safe_text_read(path, max_chars=4000) or ""
-        return f"ASCII-STL-Kopf:\n{text[:1500]}"
     size = path.stat().st_size
-    # Binary STL: 80-byte header + uint32 triangle count
-    tri_count = None
     try:
-        data = path.read_bytes()
-        if len(data) >= 84:
-            tri_count = int.from_bytes(data[80:84], "little")
-    except OSError:
-        pass
-    header = head[:80].decode("latin-1", errors="replace").strip("\x00").strip()
+        with path.open("rb") as fh:
+            head = fh.read(200)
+            if head.lstrip().lower().startswith(b"solid"):
+                text = _safe_text_read(path, max_chars=4000) or ""
+                return f"ASCII-STL-Kopf:\n{text[:1500]}"
+            # Binary STL: nur 84 Bytes (Header + Triangle-Count), nie die ganze Datei
+            fh.seek(0)
+            header = fh.read(80)
+            count_bytes = fh.read(4)
+    except OSError as exc:
+        return f"STL nicht lesbar ({size} Bytes): {exc}"
+
+    tri_count = int.from_bytes(count_bytes, "little") if len(count_bytes) == 4 else None
+    header_txt = header.decode("latin-1", errors="replace").strip("\x00").strip()
     return (
         f"Binäres STL, Größe {size} Bytes"
         + (f", ~{tri_count} Dreiecke" if tri_count is not None else "")
-        + (f", Header: {header!r}" if header else "")
+        + (f", Header: {header_txt!r}" if header_txt else "")
     )
 
 

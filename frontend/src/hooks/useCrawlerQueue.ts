@@ -7,7 +7,7 @@ export function useCrawlerQueue() {
   return useQuery({
     queryKey: ["crawler-queue"],
     queryFn: () => api.get<CrawlerQueueResponse>("/api/v1/crawler/queue"),
-    refetchInterval: 15_000,
+    refetchInterval: 120_000,
   });
 }
 

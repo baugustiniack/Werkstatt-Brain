@@ -16,13 +16,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/app ./app
 COPY agents ./agents
+COPY backend/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 EXPOSE 8000
 
-# --reload-dir beschränkt den Datei-Watcher explizit auf Quellcode-Verzeichnisse.
-# Ohne dies überwacht uvicorn das gesamte CWD (/app) inkl. exports/,
-# sandbox_workspace/ und uploads/ – jeder Sandbox-Export oder Datei-Upload
-# würde sonst einen Server-Neustart auslösen und damit den In-Memory-
-# LangGraph-Checkpointer (MemorySaver, Kap. 3.5 interrupt()) zurücksetzen.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", \
-     "--reload-dir", "/app/app", "--reload-dir", "/app/agents"]
+# --reload nur wenn UVICORN_RELOAD=1 (siehe entrypoint.sh / docker-compose).
+# Ohne Reload weniger Datei-Watcher-Last auf Windows-Hosts.
+CMD ["/entrypoint.sh"]

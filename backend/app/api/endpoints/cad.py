@@ -15,6 +15,7 @@ Workflow (SPEC Kap. 3, 5.3).
 """
 
 import asyncio
+import json
 import logging
 import threading
 import uuid
@@ -44,14 +45,67 @@ PENDING_SESSIONS: dict[str, dict[str, Any]] = {}
 # Cooperative Cancel: Session-IDs, die der Client abgebrochen hat. Der
 # WS-Stream prüft das Flag zwischen Chunks und beendet dann sauber.
 CANCELLED_SESSIONS: set[str] = set()
-# Mapping CAD-Session → Conversation für Artefakt-Persistenz
+# Mapping CAD-Session → Conversation für Artefakt-Persistenz (auch disk-gestützt)
 SESSION_CONVERSATIONS: dict[str, str] = {}
 # Pausierte Runs (nach Abbrechen / Disconnect): Snapshot + Disk-Spiegel
 PAUSED_RUNS: dict[str, dict[str, Any]] = {}
 
 
+def _session_conversation_map_path() -> Path:
+    return Path(settings.conversations_dir) / "_session_conversations.json"
+
+
+def _bind_session_conversation(session_id: str, conversation_id: str | None) -> None:
+    """Merkt Session→Conversation in RAM + JSON (überlebt API-Restart)."""
+    if not conversation_id:
+        return
+    SESSION_CONVERSATIONS[session_id] = conversation_id
+    try:
+        path = _session_conversation_map_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data: dict[str, str] = {}
+        if path.is_file():
+            raw = json.loads(path.read_text(encoding="utf-8") or "{}")
+            if isinstance(raw, dict):
+                data = {str(k): str(v) for k, v in raw.items() if v}
+        data[session_id] = conversation_id
+        if len(data) > 800:
+            data = dict(list(data.items())[-500:])
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Session→Conversation-Map konnte nicht geschrieben werden: %s", exc)
+
+
+def _resolve_conversation_id(session_id: str, values: dict[str, Any] | None = None) -> str | None:
+    cid = SESSION_CONVERSATIONS.get(session_id)
+    if cid:
+        return cid
+    if values:
+        raw = values.get("conversation_id")
+        if raw:
+            cid = str(raw)
+            SESSION_CONVERSATIONS[session_id] = cid
+            return cid
+    try:
+        path = _session_conversation_map_path()
+        if path.is_file():
+            raw = json.loads(path.read_text(encoding="utf-8") or "{}")
+            if isinstance(raw, dict) and session_id in raw:
+                cid = str(raw[session_id])
+                SESSION_CONVERSATIONS[session_id] = cid
+                return cid
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Session→Conversation-Map konnte nicht gelesen werden: %s", exc)
+    return None
+
+
 class CadGenerateRequest(BaseModel):
-    prompt: str = Field(..., min_length=3, description="Freitext-Beschreibung des gewünschten Werkstücks")
+    prompt: str = Field(
+        ...,
+        min_length=3,
+        max_length=50_000,
+        description="Freitext-Beschreibung des gewünschten Werkstücks (inkl. Referenzen, max. 50k)",
+    )
     session_id: str | None = Field(
         None, description="Optionale Session-ID; ohne Angabe wird eine neue Session erzeugt."
     )
@@ -64,6 +118,13 @@ class CadGenerateRequest(BaseModel):
             "Wenn True: führt den kompletten Workflow synchron aus und gibt das Endergebnis "
             "direkt zurück (praktisch für Skripte/Tests). Wenn False (Default): registriert nur "
             "die Session; der Live-Fortschritt wird über WS /cad/stream/{session_id} verfolgt."
+        ),
+    )
+    persist_user_message: bool = Field(
+        True,
+        description=(
+            "Wenn False: User-Nachricht wurde bereits über /conversations/.../messages gespeichert "
+            "(vermeidet Duplikate)."
         ),
     )
 
@@ -118,39 +179,68 @@ class CadWorkflowResponse(BaseModel):
 
 
 def _assistant_summary(values: dict[str, Any], status: str) -> str:
-    """Kurze Nutzer-sichtbare Zusammenfassung (kein Sub-Agenten-Log)."""
+    """Nutzer-sichtbare Zusammenfassung inkl. wesentlicher Auftragsdetails."""
     contract = values.get("requirements_contract") or {}
     title = contract.get("project_title") or "Auftrag"
     parts = contract.get("parts") or []
     completed = values.get("completed_parts") or []
+    lines: list[str] = []
+
     if status == "human_approval_required":
-        return f"Konzept „{title}“ liegt zur Freigabe bereit ({len(parts)} Teil(e))."
-    if status == "completed":
+        lines.append(f"Konzept „{title}“ liegt zur Freigabe bereit ({len(parts)} Teil(e)).")
+    elif status == "completed":
         names = ", ".join((p.get("name") or f"Teil {i+1}") for i, p in enumerate(completed)) or "keine Teile"
-        montage = values.get("montage_result") or {}
-        montage_note = ""
-        if values.get("montage_assessed"):
-            ok = montage.get("assemblable")
-            tools_rec = montage.get("tools_recommended") or []
-            manual = values.get("assembly_manual") or {}
-            montage_note = " · Montage: " + ("OK" if ok else "kritische Passung")
-            if manual.get("title") or (values.get("assembly_plan") or {}).get("manual_markdown"):
-                montage_note += " · Anleitung erstellt"
-            if tools_rec:
-                montage_note += f" · {len(tools_rec)} Werkzeug-Empfehlung(en)"
-        return f"Ausarbeitung abgeschlossen: {title} · {len(completed)} Teil(e): {names}.{montage_note}"
-    if status == "cancelled":
-        completed = values.get("completed_parts") or []
+        lines.append(f"Ausarbeitung abgeschlossen: {title} · {len(completed)} Teil(e): {names}.")
+    elif status == "cancelled":
         if completed:
             names = ", ".join((p.get("name") or f"Teil {i+1}") for i, p in enumerate(completed))
-            return (
+            lines.append(
                 f"Workflow pausiert – {len(completed)} fertige(s) Teil(e) bleiben erhalten "
                 f"({names}). Mit „Fortsetzen“ weitermachen."
             )
-        return "Workflow pausiert. Mit „Fortsetzen“ weitermachen."
-    if status == "failed":
-        return f"Ausarbeitung fehlgeschlagen ({title})."
-    return f"Status: {status} ({title})."
+        else:
+            lines.append("Workflow pausiert. Mit „Fortsetzen“ weitermachen.")
+    elif status == "failed":
+        err = values.get("error") or values.get("sandbox_error") or ""
+        lines.append(f"Ausarbeitung fehlgeschlagen ({title}).")
+        if err:
+            lines.append(str(err)[:800])
+    else:
+        lines.append(f"Status: {status} ({title}).")
+
+    if parts:
+        part_lines = []
+        for i, p in enumerate(parts[:12]):
+            name = p.get("name") or f"Teil {i + 1}"
+            dims = p.get("dimensions_mm") or p.get("size_mm") or ""
+            part_lines.append(f"- {name}" + (f" ({dims})" if dims else ""))
+        lines.append("Geplante Teile:\n" + "\n".join(part_lines))
+
+    overview = (contract.get("overview") or contract.get("summary") or contract.get("description") or "").strip()
+    if overview:
+        lines.append("Kurzbeschreibung:\n" + overview[:2000])
+
+    montage = values.get("montage_result") or {}
+    if values.get("montage_assessed"):
+        ok = montage.get("assemblable")
+        tools_rec = montage.get("tools_recommended") or []
+        note = "Montage: " + ("OK" if ok else "kritische Passung")
+        if tools_rec:
+            note += f" · {len(tools_rec)} Werkzeug-Empfehlung(en)"
+        lines.append(note)
+
+    manual = values.get("assembly_manual") or {}
+    md = (
+        manual.get("markdown")
+        or manual.get("manual_markdown")
+        or (values.get("assembly_plan") or {}).get("manual_markdown")
+        or ""
+    )
+    if isinstance(md, str) and md.strip():
+        lines.append("Montageanleitung (Auszug):\n" + md.strip()[:4000])
+
+    return "\n\n".join(lines)
+
 
 
 def _persist_session_transcript(session_id: str, values: dict[str, Any], *, status: str) -> None:
@@ -199,7 +289,7 @@ def _persist_session_transcript(session_id: str, values: dict[str, Any], *, stat
     except Exception as exc:  # noqa: BLE001
         logger.warning("Konnte Agent-Transcript nicht in DB speichern: %s", exc)
 
-    conversation_id = SESSION_CONVERSATIONS.get(session_id)
+    conversation_id = _resolve_conversation_id(session_id, values)
     if conversation_id and status in ("completed", "failed", "cancelled", "human_approval_required"):
         try:
             from app.db.postgres import SessionLocal
@@ -350,40 +440,52 @@ async def generate_cad(request: CadGenerateRequest) -> CadWorkflowResponse | Cad
     # Bei fortlaufender Unterhaltung: bisherigen Chat-Kontext dem Prompt voranstellen.
     prompt = request.prompt
     if request.conversation_id:
-        SESSION_CONVERSATIONS[session_id] = request.conversation_id
-        try:
-            from app.db.postgres import SessionLocal
-            from app.services import conversation_store
+        _bind_session_conversation(session_id, request.conversation_id)
+        from app.db.postgres import SessionLocal
+        from app.services import conversation_store
 
-            db = SessionLocal()
-            try:
-                conv_uuid = uuid.UUID(request.conversation_id)
-                conv = conversation_store.get_conversation(db, conv_uuid)
-                if conv and conv.messages:
-                    prior = [
-                        f"{m.role.upper()}: {m.content}"
-                        for m in conv.messages[-12:]
-                        if m.content.strip()
-                    ]
-                    if prior:
-                        prompt = (
-                            "Bisheriger Unterhaltungskontext:\n"
-                            + "\n".join(prior)
-                            + "\n\nNeue Nutzeranweisung:\n"
-                            + request.prompt
-                        )
-                # User-Nachricht dauerhaft in der Unterhaltung speichern
-                conversation_store.add_message(
-                    db,
-                    conv_uuid,
-                    "user",
-                    request.prompt.strip(),
-                    cad_session_id=session_id,
-                )
-            finally:
-                db.close()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Konversation-Kontext konnte nicht geladen werden: %s", exc)
+        db = SessionLocal()
+        try:
+            conv_uuid = uuid.UUID(request.conversation_id)
+            conv = conversation_store.get_conversation(db, conv_uuid)
+            if conv is None:
+                raise HTTPException(status_code=404, detail="Unterhaltung nicht gefunden.")
+            if conv.messages:
+                prior = []
+                for m in conv.messages[-8:]:
+                    content = (m.content or "").strip()
+                    if not content:
+                        continue
+                    # Alte Referenz-/Vision-Blöcke kürzen – verhindert Prompt-Explosion
+                    if len(content) > 2500:
+                        content = content[:2500] + "…"
+                    prior.append(f"{m.role.upper()}: {content}")
+                if prior:
+                    prompt = (
+                        "Bisheriger Unterhaltungskontext:\n"
+                        + "\n".join(prior)
+                        + "\n\nNeue Nutzeranweisung:\n"
+                        + request.prompt
+                    )
+                if len(prompt) > 50_000:
+                    prompt = prompt[-50_000:]
+            if request.persist_user_message:
+                try:
+                    conversation_store.add_message(
+                        db,
+                        conv_uuid,
+                        "user",
+                        request.prompt.strip(),
+                        cad_session_id=session_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("User-Nachricht konnte nicht gespeichert werden")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Chat-Nachricht konnte nicht gespeichert werden: {exc}",
+                    ) from exc
+        finally:
+            db.close()
 
     initial_state = {
         "user_prompt": prompt,
@@ -572,7 +674,7 @@ def _secure_completed_progress(values: dict[str, Any]) -> dict[str, Any]:
 
 def _persist_artifacts_only(session_id: str, values: dict[str, Any]) -> None:
     """Kopiert STEP/STL/Konzept in die Conversation und Inventar-DB, ohne Chat-Nachricht."""
-    conversation_id = SESSION_CONVERSATIONS.get(session_id)
+    conversation_id = _resolve_conversation_id(session_id, values)
     if not conversation_id or not values:
         return
     try:
@@ -655,7 +757,7 @@ def _remember_paused_run(
 ) -> dict[str, Any]:
     """Sichert Snapshot in Memory + Disk und persistiert 3D-Artefakte."""
     snap = _secure_completed_progress(values if values is not None else _snapshot_run_state(session_id))
-    conversation_id = SESSION_CONVERSATIONS.get(session_id)
+    conversation_id = _resolve_conversation_id(session_id, snap)
     PAUSED_RUNS[session_id] = {
         "values": snap,
         "conversation_id": conversation_id,
@@ -730,7 +832,7 @@ def _load_paused_bundle(session_id: str, conversation_id: str | None = None) -> 
 
     snap = _snapshot_run_state(session_id)
     if snap:
-        return {"values": snap, "conversation_id": conversation_id or SESSION_CONVERSATIONS.get(session_id)}
+        return {"values": snap, "conversation_id": conversation_id or _resolve_conversation_id(session_id, snap)}
     return None
 
 
@@ -790,8 +892,8 @@ async def resume_cad_run(request: CadResumeRunRequest) -> CadResumeRunResponse:
     CANCELLED_SESSIONS.discard(run_id)
 
     if conversation_id:
-        SESSION_CONVERSATIONS[run_id] = conversation_id
-        SESSION_CONVERSATIONS[session_id] = conversation_id
+        _bind_session_conversation(run_id, conversation_id)
+        _bind_session_conversation(session_id, conversation_id)
         try:
             from app.db.postgres import SessionLocal
             from app.services import conversation_store
@@ -964,7 +1066,7 @@ async def elaborate_concept(request: CadElaborateConceptRequest) -> CadElaborate
             hydrated["vv_consulted_phases"] = consulted
 
         PENDING_SESSIONS[run_id] = hydrated
-        SESSION_CONVERSATIONS[run_id] = request.conversation_id
+        _bind_session_conversation(run_id, request.conversation_id)
         CANCELLED_SESSIONS.discard(run_id)
 
         title = contract.get("project_title") or art.label
@@ -1068,7 +1170,7 @@ async def stream_cad_workflow(websocket: WebSocket, session_id: str) -> None:
                                 paused_run_store.save_paused_run(
                                     session_id,
                                     secured,
-                                    conversation_id=SESSION_CONVERSATIONS.get(session_id),
+                                    conversation_id=_resolve_conversation_id(session_id, secured),
                                 )
                             except Exception:  # noqa: BLE001
                                 pass
@@ -1176,7 +1278,7 @@ async def download_cad_export(session_id: str, kind: str, part_index: int | None
 
     # Fallback: Conversation-Artefakte (überleben Standby / Export-Cleanup)
     if file_path is None or not file_path.is_file():
-        conversation_id = SESSION_CONVERSATIONS.get(session_id) or (
+        conversation_id = _resolve_conversation_id(session_id) or (
             (PAUSED_RUNS.get(session_id) or {}).get("conversation_id")
         )
         if not conversation_id:

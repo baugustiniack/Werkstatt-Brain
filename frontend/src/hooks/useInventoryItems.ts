@@ -37,7 +37,7 @@ export function useInventoryItems(filters: InventoryItemFilters) {
   return useQuery({
     queryKey: [QUERY_KEY, filters],
     queryFn: () => api.get<InventoryItemListResponse>(`/api/v1/inventory/items${buildQuery(filters)}`),
-    refetchInterval: 20_000,
+    refetchInterval: false as const,
   });
 }
 
@@ -54,6 +54,14 @@ export function useUpdateInventoryItem() {
   return useMutation({
     mutationFn: ({ id, ...body }: InventoryItemUpdateRequest & { id: string }) =>
       api.patch<InventoryItem>(`/api/v1/inventory/items/${id}`, body),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: [QUERY_KEY] }),
+  });
+}
+
+export function useDeleteInventoryItem() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.delete<{ status: string; id: string }>(`/api/v1/inventory/items/${id}`),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: [QUERY_KEY] }),
   });
 }
@@ -105,7 +113,7 @@ export function useKnowledgeGraphStats() {
   return useQuery({
     queryKey: ["inventory-knowledge-graph"],
     queryFn: () => api.get<KnowledgeGraphStats>("/api/v1/inventory/knowledge-graph"),
-    refetchInterval: 60_000,
+    refetchInterval: false as const,
   });
 }
 

@@ -62,8 +62,10 @@ export async function discoverLanIpv4s(timeoutMs = 1500): Promise<string[]> {
   return [...found].sort((a, b) => rankLanIp(a) - rankLanIp(b) || a.localeCompare(b));
 }
 
+/** Cache-Bust (?v=) vor dem Hash, damit Handy/PWA nicht alte Bundle-Version hält. */
 export function buildPhoneUploadUrl(baseOrigin: string): string {
-  return `${baseOrigin.replace(/\/$/, "")}/#/mobile-upload`;
+  const base = baseOrigin.replace(/\/$/, "");
+  return `${base}/?v=multi3#/mobile-upload`;
 }
 
 export function pageOriginWithPort(): { origin: string; port: string; hostname: string } {

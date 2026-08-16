@@ -53,8 +53,8 @@ export function useConversation(id: string | null) {
     queryKey: [KEY, id],
     queryFn: () => api.get<ConversationDetail>(`/api/v1/conversations/${id}`),
     enabled: !!id,
-    // Beim Refetch keine leere Liste flashen – Chat-Einträge bleiben sichtbar
-    placeholderData: (prev) => prev,
+    // Kein Cross-Chat-Placeholder: sonst wirkt es, als würden Nachrichten „verschwinden“
+    staleTime: 5_000,
   });
 }
 

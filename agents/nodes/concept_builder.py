@@ -168,6 +168,12 @@ def _llm_decompose_request(
     advisory_notes: str | None = None,
 ) -> dict:
     user_message = f"Nutzeranfrage: {user_prompt}"
+    if "id=" in (user_prompt or "") or "Inventar-Referenz" in (user_prompt or "") or "Referenzdatei" in (user_prompt or ""):
+        user_message += (
+            "\n\nHinweis: Der Nutzer hat Inventar-/Referenzfotos mitgeschickt (Zeilen mit id=…). "
+            "Plane das Konzept so, dass es zu diesen konkreten Referenzräumen/-objekten passt "
+            "(Maße, Stil, vorhandene Instrumente/Möbel). Erfinde keinen völlig anderen Raum."
+        )
     if vv_requirements:
         user_message += (
             "\n\nV&V-Requirements (verbindlich berücksichtigen):\n"

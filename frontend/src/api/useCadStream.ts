@@ -45,7 +45,11 @@ export interface UseCadStreamResult {
   totalParts: number;
   currentPartName: string | null;
   /** Startet einen Workflow-Turn; löscht nicht den Chat-Verlauf (nur Run-State). */
-  start: (prompt: string, conversationId?: string | null) => Promise<string | null>;
+  start: (
+    prompt: string,
+    conversationId?: string | null,
+    opts?: { persistUserMessage?: boolean },
+  ) => Promise<string | null>;
   /** Setzt eine pausierte Session lückenlos fort (kein neues Konzept). */
   resume: (sessionId: string, conversationId?: string | null) => Promise<string | null>;
   /** Startet Ausarbeitung ab einem gespeicherten Konzept-Foto im Chat. */
@@ -106,14 +110,24 @@ export function useCadStream(): UseCadStreamResult {
       switch (message.type) {
         case "node_update":
           setCurrentNode(message.node);
-          setLogs((prev) => [...prev, { node: message.node, state: message.state, timestamp: Date.now() }]);
+          setLogs((prev) => {
+            // Nur schlanke Logs – volle Agent-States puffen den Browser-RAM
+            const slim: Record<string, unknown> = {};
+            for (const key of ["error", "current_part_name", "iteration_count", "status"]) {
+              if (key in message.state) slim[key] = message.state[key];
+            }
+            const next = [...prev, { node: message.node, state: slim, timestamp: Date.now() }];
+            return next.length > 40 ? next.slice(-40) : next;
+          });
           setLatestState((prev) => {
             const next: Record<string, unknown> = { ...prev, ...message.state };
             if (Array.isArray(message.state.agent_transcript)) {
-              next.agent_transcript = [
+              const merged = [
                 ...((prev.agent_transcript as unknown[]) ?? []),
                 ...message.state.agent_transcript,
               ];
+              // Transcript begrenzen
+              next.agent_transcript = merged.length > 80 ? merged.slice(-80) : merged;
             }
             // completed_parts nie durch leere Updates verlieren
             if (
@@ -175,7 +189,7 @@ export function useCadStream(): UseCadStreamResult {
   }, []);
 
   const start = useCallback(
-    async (prompt: string, conversationId?: string | null) => {
+    async (prompt: string, conversationId?: string | null, opts?: { persistUserMessage?: boolean }) => {
       // Nur Run-State zurücksetzen – Chat bleibt in der Conversation-API.
       const prevSocket = socketRef.current;
       socketRef.current = null;
@@ -193,6 +207,7 @@ export function useCadStream(): UseCadStreamResult {
         const pending = await api.post<{ session_id: string; status: string }>("/api/v1/cad/generate", {
           prompt,
           conversation_id: conversationId || undefined,
+          persist_user_message: opts?.persistUserMessage !== false,
         });
         sessionIdRef.current = pending.session_id;
         setSessionId(pending.session_id);

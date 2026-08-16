@@ -1,5 +1,7 @@
 # Werkstatt-Brain – Phase 1 (SPEC Kap. 1.2)
 # Services: FastAPI, PostgreSQL, Qdrant, Redis
+#
+# Ressourcen-Limits schützen den Windows-Host vor OOM/Freeze durch Docker.
 
 services:
   api:
@@ -9,6 +11,9 @@ services:
     container_name: werkstatt-api
     restart: unless-stopped
     env_file: .env
+    environment:
+      # 0/false = kein --reload (stabiler, weniger Disk-I/O auf Windows)
+      UVICORN_RELOAD: ${UVICORN_RELOAD:-0}
     ports:
       - "${API_PORT:-8000}:8000"
     volumes:
@@ -36,6 +41,9 @@ services:
         condition: service_started
     networks:
       - werkstatt-net
+    # 1.5g: Vision-Downscale + PDF/STL-Kontext brauchen Headroom ohne Host-OOM
+    mem_limit: 1536m
+    cpus: 2.0
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -59,6 +67,8 @@ services:
       - ./db/init:/docker-entrypoint-initdb.d:ro
     networks:
       - werkstatt-net
+    mem_limit: 512m
+    cpus: 1.0
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-werkstatt} -d ${POSTGRES_DB:-werkstatt_brain}"]
       interval: 10s
@@ -77,6 +87,8 @@ services:
       - qdrant_data:/qdrant/storage
     networks:
       - werkstatt-net
+    mem_limit: 512m
+    cpus: 0.75
 
   redis:
     image: redis:7-alpine
@@ -89,6 +101,8 @@ services:
       - redis_data:/data
     networks:
       - werkstatt-net
+    mem_limit: 320m
+    cpus: 0.5
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -107,6 +121,10 @@ services:
       VITE_API_BASE_URL: http://localhost:${API_PORT:-8000}
       VITE_WS_BASE_URL: ws://localhost:${API_PORT:-8000}
       VITE_PROXY_TARGET: http://api:8000
+      # Polling standardmäßig AUS (verhindert Host-Freeze auf Windows). Bei fehlendem
+      # Hot-Reload: CHOKIDAR_USEPOLLING=true und optional CHOKIDAR_INTERVAL=3000 setzen.
+      CHOKIDAR_USEPOLLING: ${CHOKIDAR_USEPOLLING:-false}
+      CHOKIDAR_INTERVAL: ${CHOKIDAR_INTERVAL:-3000}
     ports:
       - "${FRONTEND_PORT:-5173}:5173"
     volumes:
@@ -116,6 +134,8 @@ services:
       - api
     networks:
       - werkstatt-net
+    mem_limit: 768m
+    cpus: 1.5
 
   # ── Sandbox-Image (nur zum Bauen; Instanzen werden ephemer per
   #    app.services.sandbox_runner über den Docker-Socket gestartet) ────────

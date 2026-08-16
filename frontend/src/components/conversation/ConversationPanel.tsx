@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
-import { apiBaseUrl } from "../../api/client";
+import { api, apiBaseUrl } from "../../api/client";
 import type { ConceptDecision, EscalationPayload } from "../../api/types";
 import type { CadRunStatus, UseCadStreamResult } from "../../api/useCadStream";
 import {
@@ -13,6 +13,7 @@ import {
   type ConversationArtifact,
 } from "../../hooks/useConversations";
 import { StatusBadge } from "../layout/StatusBadge";
+import type { ReferenceMediaPreview } from "../modelViewer/ModelViewer";
 import { ReferenceUpload } from "../commandCenter/ReferenceUpload";
 
 const ACTIVE_CONV_KEY = "werkstatt.activeConversationId";
@@ -175,6 +176,7 @@ export interface ConversationPanelProps {
   activeConversationId: string | null;
   onActiveConversationIdChange: (id: string | null) => void;
   onArtifactsChange?: (artifacts: ConversationArtifact[]) => void;
+  onReferencePreviewChange?: (preview: ReferenceMediaPreview | null) => void;
 }
 
 /** Gemini-ähnliche Unterhaltung: Chat-Liste, Verlauf bleibt, Artefakte wiederaufrufbar. */
@@ -185,6 +187,7 @@ export function ConversationPanel({
   activeConversationId,
   onActiveConversationIdChange,
   onArtifactsChange,
+  onReferencePreviewChange,
 }: ConversationPanelProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const qc = useQueryClient();
@@ -193,6 +196,8 @@ export function ConversationPanel({
   const createConv = useCreateConversation();
   const deleteConv = useDeleteConversation();
   const [pendingDelete, setPendingDelete] = useState<{ id: string; title: string } | null>(null);
+  const [attachContext, setAttachContext] = useState("");
+  const [attachClearToken, setAttachClearToken] = useState(0);
 
   const isBusy = cad.status === "connecting" || cad.status === "running" || cad.status === "escalation";
 
@@ -333,11 +338,36 @@ export function ConversationPanel({
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
     if (isBusy || prompt.trim().length < 3) return;
-    const text = prompt.trim();
+    let text = [prompt.trim(), attachContext.trim()].filter(Boolean).join("\n\n");
+    // Client-Schutz: gleiche Grenze wie Backend (50k)
+    if (text.length > 50_000) {
+      text = text.slice(0, 50_000);
+    }
     const convId = await ensureConversation();
     if (!convId) return;
+
+    // 1) User-Nachricht zuerst dauerhaft speichern – sonst geht sie bei Fehlern verloren
+    try {
+      await api.post(`/api/v1/conversations/${convId}/messages`, {
+        role: "user",
+        content: text,
+      });
+    } catch (err) {
+      window.alert(
+        err instanceof Error
+          ? `Nachricht konnte nicht gespeichert werden: ${err.message}`
+          : "Nachricht konnte nicht gespeichert werden.",
+      );
+      return;
+    }
+
     onPromptChange("");
-    await cad.start(text, convId);
+    setAttachContext("");
+    setAttachClearToken((n) => n + 1);
+    invalidateConversation(qc, convId);
+
+    // 2) CAD starten ohne zweite User-Message in der DB
+    await cad.start(text, convId, { persistUserMessage: false });
     invalidateConversation(qc, convId);
   };
 
@@ -575,17 +605,31 @@ export function ConversationPanel({
           {cad.errorMessage && <p className="text-xs text-workshop-danger">{cad.errorMessage}</p>}
         </div>
 
-        <form onSubmit={(e) => void handleSubmit(e)} className="flex shrink-0 flex-col gap-2 border-t border-workshop-border pt-3">
-          <ReferenceUpload onAttach={(text) => onPromptChange(prompt ? `${prompt}\n${text}` : text)} />
+        <form
+          onSubmit={(e) => void handleSubmit(e)}
+          className="flex max-h-[46%] min-h-0 shrink-0 flex-col gap-2 border-t border-workshop-border pt-3"
+        >
+          <div className="min-h-0 overflow-y-auto">
+            <ReferenceUpload
+              onContextChange={setAttachContext}
+              onPreviewChange={onReferencePreviewChange}
+              clearToken={attachClearToken}
+            />
+          </div>
           <textarea
             rows={3}
             value={prompt}
             onChange={(event) => onPromptChange(event.target.value)}
             placeholder='Folgeanweisung oder z. B. "Eckschrank für 1. OG…"'
             disabled={isBusy}
-            className="resize-none rounded-md border border-workshop-border bg-workshop-bg p-3 text-sm text-workshop-text placeholder:text-workshop-muted focus:border-workshop-accent focus:outline-none disabled:opacity-60"
+            className="shrink-0 resize-none rounded-md border border-workshop-border bg-workshop-bg p-3 text-sm text-workshop-text placeholder:text-workshop-muted focus:border-workshop-accent focus:outline-none disabled:opacity-60"
           />
-          <div className="flex justify-end gap-2">
+          {attachContext.trim() && (
+            <p className="shrink-0 text-[10px] text-workshop-muted">
+              Inventar-/Datei-Beschreibungen werden beim Senden mitgeschickt, erscheinen aber nicht im Textfeld.
+            </p>
+          )}
+          <div className="flex shrink-0 justify-end gap-2">
             {canResume && (
               <button
                 type="button"

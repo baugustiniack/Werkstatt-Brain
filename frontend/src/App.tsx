@@ -5,7 +5,7 @@ import { useCadStream } from "./api/useCadStream";
 import { DashboardLayout, type DashboardTab } from "./components/layout/DashboardLayout";
 import { ConversationPanel } from "./components/conversation/ConversationPanel";
 import { EscalationDialog } from "./components/agentTrace/EscalationDialog";
-import { ModelViewer, type ModelViewerPart } from "./components/modelViewer/ModelViewer";
+import { ModelViewer, type ModelViewerPart, type ReferenceMediaPreview } from "./components/modelViewer/ModelViewer";
 import { DownloadCenter } from "./components/modelViewer/DownloadCenter";
 import { MigrateButton } from "./components/modelViewer/MigrateButton";
 import { AssetLibrary } from "./components/inventory/AssetLibrary";
@@ -43,6 +43,7 @@ function App() {
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [conversationArtifacts, setConversationArtifacts] = useState<ConversationArtifact[]>([]);
   const [activeTab, setActiveTab] = useState<DashboardTab>("workspace");
+  const [referencePreview, setReferencePreview] = useState<ReferenceMediaPreview | null>(null);
   const cad = useCadStream();
 
   const onArtifactsChange = useCallback((artifacts: ConversationArtifact[]) => {
@@ -113,13 +114,14 @@ function App() {
                   activeConversationId={activeConversationId}
                   onActiveConversationIdChange={setActiveConversationId}
                   onArtifactsChange={onArtifactsChange}
+                  onReferencePreviewChange={setReferencePreview}
                 />
               </div>
             </section>
             <section className="flex min-h-0 flex-col rounded-lg border border-workshop-border bg-workshop-panel">
               <header className="border-b border-workshop-border px-4 py-2">
                 <h2 className="text-xs font-mono font-semibold tracking-widest text-workshop-muted uppercase">
-                  3D Model Viewer
+                  {referencePreview ? "Model Viewer · Referenz" : "3D Model Viewer"}
                 </h2>
               </header>
               <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
@@ -129,6 +131,8 @@ function App() {
                     parts={parts}
                     selectedPartIndex={selectedPartIndex}
                     onSelectPartIndex={setSelectedPartIndex}
+                    referencePreview={referencePreview}
+                    onClearReferencePreview={() => setReferencePreview(null)}
                   />
                 </div>
                 <DownloadCenter

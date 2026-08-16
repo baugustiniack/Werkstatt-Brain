@@ -33,17 +33,19 @@ function StlMesh({ url }: { url: string }) {
   );
 }
 
-function StlPreview({ url }: { url: string }) {
+function StlPreview({ url, heightClass = "h-56" }: { url: string; heightClass?: string }) {
   return (
     <PreviewErrorBoundary
       fallback={
-        <div className="flex h-56 w-full items-center justify-center rounded-md border border-dashed border-workshop-border bg-black/20 text-xs text-workshop-muted">
+        <div
+          className={`flex w-full items-center justify-center rounded-md border border-dashed border-workshop-border bg-black/20 text-xs text-workshop-muted ${heightClass}`}
+        >
           STL konnte nicht geladen werden
         </div>
       }
     >
-      <div className="h-56 w-full overflow-hidden rounded-md border border-workshop-border bg-black/40">
-        <Canvas frameloop="demand" dpr={[1, 1.5]} camera={{ position: [80, 80, 80], fov: 40 }}>
+      <div className={`w-full overflow-hidden rounded-md border border-workshop-border bg-black/40 ${heightClass}`}>
+        <Canvas frameloop="demand" dpr={[1, 1]} camera={{ position: [80, 80, 80], fov: 40 }}>
           <ambientLight intensity={0.7} />
           <directionalLight position={[60, 100, 40]} intensity={1.1} />
           <Suspense fallback={null}>
@@ -58,23 +60,27 @@ function StlPreview({ url }: { url: string }) {
   );
 }
 
-function PdfPreview({ url }: { url: string }) {
+function PdfPreview({ url, heightClass = "h-72" }: { url: string; heightClass?: string }) {
   return (
-    <div className="flex h-72 w-full flex-col overflow-hidden rounded-md border border-workshop-border bg-black/30">
-      <iframe title="PDF-Voransicht" src={`${url}#toolbar=1&navpanes=0`} className="h-full w-full bg-white" />
+    <div
+      className={`flex w-full flex-col overflow-hidden rounded-md border border-workshop-border bg-black/30 ${heightClass}`}
+    >
+      <iframe title="PDF-Voransicht" src={`${url}#toolbar=0&navpanes=0&scrollbar=0`} className="h-full w-full bg-white" />
     </div>
   );
 }
 
-function ImagePreview({ url, compact }: { url: string; compact?: boolean }) {
-  if (compact) {
-    return <img src={url} alt="" className="h-10 w-10 shrink-0 rounded object-cover" />;
-  }
+function ImagePreview({ url, className }: { url: string; className?: string }) {
   return (
     <img
       src={url}
       alt=""
-      className="max-h-56 w-full rounded-md border border-workshop-border object-contain bg-black/20"
+      loading="lazy"
+      decoding="async"
+      className={
+        className ??
+        "max-h-56 w-full rounded-md border border-workshop-border object-contain bg-black/20"
+      }
     />
   );
 }
@@ -87,8 +93,105 @@ function TypeBadge({ label }: { label: string }) {
   );
 }
 
+export type PreviewKind = "image" | "pdf" | "stl" | "other";
+
+export function resolvePreviewKind(fileType: string, fileName?: string | null): PreviewKind {
+  const lower = (fileName ?? "").toLowerCase();
+  if (fileType === "image" || /\.(png|jpe?g|webp|gif|bmp|tiff?|heic|heif)$/i.test(lower)) return "image";
+  if (fileType === "pdf" || lower.endsWith(".pdf")) return "pdf";
+  if (fileType === "stl" || lower.endsWith(".stl")) return "stl";
+  return "other";
+}
+
+/** Kompakte Listen-Vorschau ohne Datei-Download (verhindert Massen-Loads / Host-Freeze). */
+export function AssetListIcon({
+  fileType,
+  fileName,
+}: {
+  fileType: AssetFileType;
+  fileName?: string | null;
+}) {
+  const kind = resolvePreviewKind(fileType, fileName);
+  if (kind === "image") return <TypeBadge label="IMG" />;
+  if (kind === "pdf") return <TypeBadge label="PDF" />;
+  if (kind === "stl") return <TypeBadge label="STL" />;
+  const lower = (fileName ?? "").toLowerCase();
+  if (fileType === "step" || lower.endsWith(".step") || lower.endsWith(".stp")) {
+    return <TypeBadge label="STEP" />;
+  }
+  if (fileType === "f3d") return <TypeBadge label="F3D" />;
+  if (fileType === "manual") return <TypeBadge label="TXT" />;
+  return <TypeBadge label="FILE" />;
+}
+
 export function assetFileUrl(itemId: string): string {
   return `${apiBaseUrl()}/api/v1/inventory/items/${itemId}/file?inline=1`;
+}
+
+/**
+ * Flexible Voransicht (Bild / PDF / STL).
+ * `eager3d`: schwere Medien (PDF-iframe / STL-WebGL) nur laden wenn true –
+ * sonst friert das Raster bei vielen Einträgen ein.
+ */
+export function MediaFilePreview({
+  itemId,
+  fileType,
+  fileName,
+  heightClass = "h-56",
+  eager3d = true,
+}: {
+  itemId: string;
+  fileType: AssetFileType | string;
+  fileName?: string | null;
+  heightClass?: string;
+  eager3d?: boolean;
+}) {
+  const url = assetFileUrl(itemId);
+  const kind = resolvePreviewKind(fileType, fileName);
+
+  if (kind === "image") {
+    return (
+      <ImagePreview
+        url={url}
+        className={`w-full rounded-md border border-workshop-border object-contain bg-black/20 ${heightClass}`}
+      />
+    );
+  }
+  if (kind === "pdf") {
+    if (!eager3d) {
+      return (
+        <div className={`flex w-full flex-col items-center justify-center gap-1 bg-black/35 ${heightClass}`}>
+          <span className="text-xs font-semibold uppercase text-workshop-accent">PDF</span>
+          <span className="max-w-[90%] truncate px-2 text-[11px] text-workshop-text">
+            {fileName || "Dokument"}
+          </span>
+          <span className="text-[10px] text-workshop-muted">Tippen → Vorschau</span>
+        </div>
+      );
+    }
+    return <PdfPreview url={url} heightClass={heightClass} />;
+  }
+  if (kind === "stl") {
+    if (!eager3d) {
+      return (
+        <div className={`flex w-full flex-col items-center justify-center gap-1 bg-black/35 ${heightClass}`}>
+          <span className="text-xs font-semibold uppercase text-workshop-accent">STL</span>
+          <span className="max-w-[90%] truncate px-2 text-[11px] text-workshop-text">
+            {fileName || "3D-Modell"}
+          </span>
+          <span className="text-[10px] text-workshop-muted">Tippen → 3D-Vorschau</span>
+        </div>
+      );
+    }
+    return <StlPreview url={url} heightClass={heightClass} />;
+  }
+
+  return (
+    <div className={`flex w-full flex-col items-center justify-center gap-1 bg-workshop-panel ${heightClass}`}>
+      <span className="text-xs font-semibold uppercase text-workshop-muted">{fileType}</span>
+      <span className="max-w-[90%] truncate px-2 text-[11px] text-workshop-text">{fileName || "Datei"}</span>
+    </div>
+  );
 }
 
 /** Voransicht für Inventar-Anhänge: Bild, PDF (Browser), STL (WebGL). */
@@ -103,31 +206,8 @@ export function AssetPreview({
   fileName?: string | null;
   compact?: boolean;
 }) {
-  const url = assetFileUrl(itemId);
-  const lower = (fileName ?? "").toLowerCase();
-  const isPdf = fileType === "pdf" || lower.endsWith(".pdf");
-  const isStl = fileType === "stl" || lower.endsWith(".stl");
-  const isImage = fileType === "image" || /\.(png|jpe?g|webp|gif|bmp|tiff?)$/i.test(lower);
-
-  if (isImage) return <ImagePreview url={url} compact={compact} />;
-  if (isPdf) {
-    if (compact) return <TypeBadge label="PDF" />;
-    return <PdfPreview url={url} />;
-  }
-  if (isStl) {
-    if (compact) return <TypeBadge label="STL" />;
-    return <StlPreview url={url} />;
-  }
-
   if (compact) {
-    const label =
-      fileType === "step" ? "STEP" : fileType === "f3d" ? "F3D" : fileType === "manual" ? "TXT" : "FILE";
-    return <TypeBadge label={label} />;
+    return <AssetListIcon fileType={fileType} fileName={fileName} />;
   }
-
-  return (
-    <div className="flex h-24 items-center justify-center rounded-md border border-dashed border-workshop-border text-xs text-workshop-muted">
-      Keine Voransicht für {fileType}
-    </div>
-  );
+  return <MediaFilePreview itemId={itemId} fileType={fileType} fileName={fileName} />;
 }

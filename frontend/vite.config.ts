@@ -5,6 +5,11 @@ import { VitePWA } from "vite-plugin-pwa";
 
 // Werkstatt-Brain Dashboard (SPEC Kap. 5) – Vite-Konfiguration.
 // Hinweis: Liegt js und ts parallel, hat js Vorrang – Proxy in beiden pflegen.
+const usePolling = ["1", "true", "yes"].includes(
+  String(process.env.CHOKIDAR_USEPOLLING || process.env.VITE_USE_POLLING || "").toLowerCase(),
+);
+const pollInterval = Number(process.env.CHOKIDAR_INTERVAL || process.env.VITE_POLL_INTERVAL || 3000);
+
 export default defineConfig({
   plugins: [
     react(),
@@ -47,7 +52,9 @@ export default defineConfig({
       },
     },
     watch: {
-      usePolling: true,
+      usePolling,
+      ...(usePolling ? { interval: Number.isFinite(pollInterval) ? pollInterval : 3000 } : {}),
+      ignored: ["**/node_modules/**", "**/.git/**", "**/dist/**", "**/*.log", "**/package-lock.json"],
     },
   },
 });
