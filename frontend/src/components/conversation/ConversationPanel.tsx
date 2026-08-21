@@ -15,7 +15,7 @@ import {
 import { StatusBadge } from "../layout/StatusBadge";
 import type { ReferenceMediaPreview } from "../modelViewer/ModelViewer";
 import { ReferenceUpload } from "../commandCenter/ReferenceUpload";
-import { ClarificationPanel } from "../agentTrace/EscalationDialog";
+import { ClarificationPanel, RequirementsConfirmPanel } from "../agentTrace/EscalationDialog";
 import { assetFileUrl } from "../inventory/AssetPreview";
 
 const ACTIVE_CONV_KEY = "werkstatt.activeConversationId";
@@ -27,6 +27,94 @@ function resolveMediaUrl(url: string | null | undefined): string | null {
 
 type ContractParts = NonNullable<EscalationPayload["requirements_contract"]>["parts"];
 
+const COMPLEXITY_LABEL: Record<string, string> = {
+  low: "niedrig",
+  medium: "mittel",
+  high: "hoch",
+};
+
+const ROSTER_LABEL: Record<string, string> = {
+  flexible_specialist: "Flexible",
+  interior_architect: "Innenarchitekt",
+  vv_manager: "V&V",
+  concept_critic: "Critic",
+  fertigung_specialist: "Fertigung",
+};
+
+function complexityLabel(level: string | null | undefined): string {
+  if (!level) return "";
+  return COMPLEXITY_LABEL[level] ?? level;
+}
+
+function rosterLabel(agentId: string): string {
+  return ROSTER_LABEL[agentId] ?? agentId;
+}
+
+function gradeChipClass(grade?: number | null): string {
+  if (grade == null || Number.isNaN(grade)) {
+    return "border-workshop-border text-workshop-muted";
+  }
+  if (grade <= 2) {
+    return "border-workshop-success/50 bg-workshop-success/10 text-workshop-success";
+  }
+  if (grade <= 4) {
+    return "border-workshop-border bg-workshop-panel/80 text-workshop-text";
+  }
+  return "border-workshop-danger/50 bg-workshop-danger/10 text-workshop-danger";
+}
+
+function PanelFeedbackDetail({ grades }: { grades: NonNullable<EscalationPayload["concept_panel_grades"]> }) {
+  return (
+    <div className="space-y-2">
+      {grades.map((g, i) => {
+        const issues = (g.issues ?? []).filter(Boolean);
+        const strengths = (g.strengths ?? []).filter(Boolean);
+        const improvement = (g.improvement ?? "").trim();
+        const verdict = (g.verdict ?? "").trim();
+        return (
+          <div
+            key={`${g.agent_id ?? "a"}-${i}`}
+            className="rounded border border-workshop-border/80 bg-workshop-panel/40 px-2 py-1.5 text-[11px] leading-snug"
+          >
+            <div className="mb-1 flex flex-wrap items-center gap-2">
+              <span
+                className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-semibold tabular-nums ${gradeChipClass(g.grade)}`}
+              >
+                {g.grade ?? "–"}
+              </span>
+              <span className="font-semibold text-workshop-text">{rosterLabel(g.agent_id ?? "Agent")}</span>
+            </div>
+            {verdict && <p className="whitespace-pre-wrap text-workshop-text">{verdict}</p>}
+            {strengths.length > 0 && (
+              <ul className="mt-1 list-inside list-disc text-workshop-muted">
+                {strengths.map((item) => (
+                  <li key={item} className="whitespace-pre-wrap">
+                    {item}
+                  </li>
+                ))}
+              </ul>
+            )}
+            {issues.length > 0 && (
+              <ul className="mt-1 list-inside list-disc text-workshop-warning/90">
+                {issues.map((item) => (
+                  <li key={item} className="whitespace-pre-wrap">
+                    {item}
+                  </li>
+                ))}
+              </ul>
+            )}
+            {improvement && (
+              <p className="mt-1 whitespace-pre-wrap text-workshop-accent">
+                <span className="font-semibold">Verbesserung:</span> {improvement}
+              </p>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function ConceptImageCard({
   title,
   imageUrl,
@@ -36,8 +124,11 @@ function ConceptImageCard({
   coherenceCritique,
   panelGrades,
   panelAverage,
-  panelForced,
+  panelReverted,
   panelRound,
+  complexity,
+  roster,
+  complexityReasons,
   parts,
   interactive,
   onDecision,
@@ -53,8 +144,11 @@ function ConceptImageCard({
   coherenceCritique?: EscalationPayload["coherence_critique"];
   panelGrades?: EscalationPayload["concept_panel_grades"];
   panelAverage?: number | null;
-  panelForced?: boolean;
+  panelReverted?: boolean;
   panelRound?: number | null;
+  complexity?: string | null;
+  roster?: string[] | null;
+  complexityReasons?: string[] | null;
   parts?: ContractParts;
   interactive?: boolean;
   onDecision?: (decision: ConceptDecision) => void;
@@ -64,7 +158,9 @@ function ConceptImageCard({
 }) {
   const [mode, setMode] = useState<"view" | "revise">("view");
   const [feedback, setFeedback] = useState("");
+  const [userGrade, setUserGrade] = useState<number | null>(null);
   const [partsOpen, setPartsOpen] = useState(false);
+  const [feedbackOpen, setFeedbackOpen] = useState(true);
   const [activeIdx, setActiveIdx] = useState(0);
   const [fetchedUrls, setFetchedUrls] = useState<Array<{
     url: string;
@@ -140,7 +236,13 @@ function ConceptImageCard({
     <div className="rounded-lg border border-workshop-accent/60 bg-workshop-bg/80 p-3">
       <div className="mb-2 flex items-start justify-between gap-2">
         <div className="text-xs font-semibold text-workshop-accent">
-          {interactive ? `Konzept zur Freigabe: ${title}` : `Konzept: ${title}`}
+          {interactive
+            ? panelRound
+              ? `Konzept Runde ${panelRound} – deine Entscheidung: ${title}`
+              : `Konzept zur Entscheidung: ${title}`
+            : panelRound
+              ? `Konzept Runde ${panelRound}: ${title}`
+              : `Konzept: ${title}`}
         </div>
         <span
           className="shrink-0 rounded border border-workshop-border px-1.5 py-0.5 text-[10px] text-workshop-muted"
@@ -159,24 +261,37 @@ function ConceptImageCard({
       )}
 
       {(panelGrades?.length ?? 0) > 0 && (
-        <div className="mb-3 rounded border border-workshop-accent/40 bg-workshop-accent/5 px-2.5 py-2">
-          <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-workshop-accent">
-            Jury-Notenspiegel
-            {panelRound ? ` · Runde ${panelRound}` : ""}
-            {panelAverage != null ? ` · Schnitt ${panelAverage}` : ""}
-            {panelForced ? " · Max-Runden (Restrisiko)" : ""}
+        <div className="mb-3 rounded border border-workshop-border/80 bg-workshop-panel/50 px-2 py-1.5">
+          <div className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] text-workshop-muted">
+            <span className="font-semibold uppercase tracking-wide text-workshop-accent">Agenten-Noten</span>
+            {panelAverage != null ? <span>Schnitt {panelAverage}</span> : null}
+            {panelRound ? <span>Runde {panelRound}</span> : null}
+            {panelReverted ? <span>vorherige Fassung</span> : null}
+            {complexity ? <span>Komplexität {complexityLabel(complexity)}</span> : null}
           </div>
-          <ul className="space-y-1 text-[11px] text-workshop-text">
+          <div className="mb-2 flex flex-wrap gap-1.5">
             {panelGrades!.map((g, i) => (
-              <li key={`${g.agent_id ?? "a"}-${i}`} className="flex gap-2">
-                <span className="w-6 shrink-0 font-semibold text-workshop-accent">{g.grade ?? "–"}</span>
-                <span className="min-w-0">
-                  <span className="font-medium">{g.agent_id ?? "Agent"}</span>
-                  {g.verdict ? <span className="text-workshop-muted"> – {g.verdict}</span> : null}
-                </span>
-              </li>
+              <span
+                key={`${g.agent_id ?? "a"}-${i}`}
+                className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-medium ${gradeChipClass(g.grade)}`}
+              >
+                <span className="tabular-nums">{g.grade ?? "–"}</span>
+                <span>{rosterLabel(g.agent_id ?? "Agent")}</span>
+              </span>
             ))}
-          </ul>
+          </div>
+          <button
+            type="button"
+            onClick={() => setFeedbackOpen((v) => !v)}
+            className="text-[10px] font-semibold text-workshop-muted hover:text-workshop-text"
+          >
+            {feedbackOpen ? "▾" : "▸"} Detailliertes Agenten-Feedback
+          </button>
+          {feedbackOpen && (
+            <div className="mt-2 max-h-56 overflow-y-auto">
+              <PanelFeedbackDetail grades={panelGrades!} />
+            </div>
+          )}
         </div>
       )}
 
@@ -337,11 +452,32 @@ function ConceptImageCard({
         <>
           {mode === "revise" ? (
             <div className="flex flex-col gap-2">
+              <div>
+                <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-workshop-muted">
+                  Deine Bewertung (optional)
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {[1, 2, 3, 4, 5, 6].map((g) => (
+                    <button
+                      key={g}
+                      type="button"
+                      onClick={() => setUserGrade(userGrade === g ? null : g)}
+                      className={`rounded border px-2 py-1 text-[10px] font-semibold tabular-nums ${
+                        userGrade === g
+                          ? "border-workshop-accent bg-workshop-accent/20 text-workshop-accent"
+                          : "border-workshop-border text-workshop-muted hover:text-workshop-text"
+                      }`}
+                    >
+                      {g}
+                    </button>
+                  ))}
+                </div>
+              </div>
               <textarea
                 value={feedback}
                 onChange={(event) => setFeedback(event.target.value)}
-                placeholder="Was soll am Entwurf geändert werden?"
-                rows={2}
+                placeholder="Was soll der Concept Builder in der nächsten Runde anders machen? (optional – Jury-Feedback wird automatisch mitgegeben)"
+                rows={3}
                 className="w-full resize-none rounded-md border border-workshop-border bg-workshop-panel p-2 text-xs"
               />
               <div className="flex justify-end gap-2">
@@ -350,31 +486,42 @@ function ConceptImageCard({
                 </button>
                 <button
                   type="button"
-                  disabled={!feedback.trim()}
-                  onClick={() => onDecision({ decision: "revise", feedback: feedback.trim() })}
-                  className="rounded-md bg-workshop-warning px-3 py-1.5 text-xs font-semibold text-workshop-bg disabled:opacity-40"
+                  onClick={() =>
+                    onDecision({
+                      decision: "next_round",
+                      feedback: feedback.trim() || undefined,
+                      user_grade: userGrade ?? undefined,
+                    })
+                  }
+                  className="rounded-md bg-workshop-warning px-3 py-1.5 text-xs font-semibold text-workshop-bg"
                 >
-                  Änderungen anfordern
+                  Nächste Runde starten
                 </button>
               </div>
             </div>
           ) : (
-            <div className="flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setMode("revise")}
-                className="rounded-md border border-workshop-border px-3 py-1.5 text-xs font-semibold text-workshop-text hover:bg-workshop-panel"
-              >
-                Änderungen anfordern
-              </button>
-              <button
-                type="button"
-                onClick={() => onDecision({ decision: "approve" })}
-                className="rounded-md bg-workshop-accent px-3 py-1.5 text-xs font-semibold text-workshop-bg"
-                title="Gibt das Gesamt-Konzept frei (Maßgeblich = Raumsituation), nicht einzelne Thumbnails"
-              >
-                Gesamt-Konzept freigeben
-              </button>
+            <div className="flex flex-col gap-2">
+              <p className="text-[11px] leading-snug text-workshop-muted">
+                Du entscheidest: Konzept freigeben und ausarbeiten lassen, oder eine weitere Runde mit
+                Agenten-Feedback (und optional deiner eigenen Note) starten.
+              </p>
+              <div className="flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setMode("revise")}
+                  className="rounded-md border border-workshop-border px-3 py-1.5 text-xs font-semibold text-workshop-text hover:bg-workshop-panel"
+                >
+                  Nächste Runde
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onDecision({ decision: "approve" })}
+                  className="rounded-md bg-workshop-accent px-3 py-1.5 text-xs font-semibold text-workshop-bg"
+                  title="Gibt das Gesamt-Konzept frei (Maßgeblich = Raumsituation), nicht einzelne Thumbnails"
+                >
+                  Konzept freigeben
+                </button>
+              </div>
             </div>
           )}
         </>
@@ -452,7 +599,7 @@ export function ConversationPanel({
     onArtifactsChange?.(detail?.artifacts ?? []);
   }, [detail?.artifacts, onArtifactsChange]);
 
-  // Nach Run-Ende / Eskalation Conversation neu laden (Nachrichten + Artefakte)
+  // Nach Run-Ende / Eskalation / Entscheidung Conversation neu laden
   useEffect(() => {
     if (
       activeConversationId &&
@@ -460,6 +607,7 @@ export function ConversationPanel({
         cad.status === "failed" ||
         cad.status === "cancelled" ||
         cad.status === "escalation" ||
+        cad.status === "running" ||
         cad.status === "error")
     ) {
       invalidateConversation(qc, activeConversationId);
@@ -494,18 +642,27 @@ export function ConversationPanel({
     (cad.escalation.reason === "concept_clarification" ||
       cad.escalation.reason === "requirements_question");
 
+  const showRequirementsConfirm =
+    cad.status === "escalation" &&
+    cad.escalation &&
+    (cad.escalation.reason === "requirements_confirm" ||
+      cad.escalation.reason === "requirements_approval");
+
   const conceptArtifacts = useMemo(() => {
     const arts = (detail?.artifacts ?? []).filter((a) => a.kind === "concept_image");
-    // Während Live-Freigabe: nur die neueste Version derselben Session ausblenden
-    // (ältere Konzepte bleiben mit „Ausarbeiten“ sichtbar)
-    if (showConcept && cad.sessionId) {
-      const sameSession = arts.filter((a) => a.cad_session_id === cad.sessionId);
-      if (sameSession.length === 0) return arts;
-      const newestId = [...sameSession].sort((a, b) => b.created_at.localeCompare(a.created_at))[0]?.id;
-      return arts.filter((a) => a.id !== newestId);
-    }
-    return arts;
-  }, [detail?.artifacts, showConcept, cad.sessionId]);
+    if (!showConcept || !cad.sessionId) return arts;
+    const liveRound = cad.escalation?.concept_panel_round;
+    const sameSession = arts.filter((a) => a.cad_session_id === cad.sessionId);
+    if (sameSession.length === 0) return arts;
+    const duplicate = [...sameSession]
+      .filter((a) => {
+        const meta = a.meta ?? {};
+        return liveRound == null || meta.concept_panel_round === liveRound;
+      })
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+    if (!duplicate) return arts;
+    return arts.filter((a) => a.id !== duplicate.id);
+  }, [detail?.artifacts, showConcept, cad.sessionId, cad.escalation?.concept_panel_round]);
 
   const handleElaborateConcept = async (artifactId: string) => {
     if (!activeConversationId || isBusy) return;
@@ -799,6 +956,10 @@ export function ConversationPanel({
               project_title?: string;
               ausarbeiten?: boolean;
               concept_image_urls?: EscalationPayload["concept_image_urls"];
+              concept_panel_grades?: EscalationPayload["concept_panel_grades"];
+              concept_panel_average?: number | null;
+              concept_panel_round?: number | null;
+              concept_panel_reverted?: boolean;
               session_id?: string;
             };
             return (
@@ -808,6 +969,10 @@ export function ConversationPanel({
                   imageUrl={resolveMediaUrl(art.url)}
                   imageUrls={meta.concept_image_urls}
                   sessionId={meta.session_id || art.cad_session_id}
+                  panelGrades={meta.concept_panel_grades}
+                  panelAverage={meta.concept_panel_average}
+                  panelRound={meta.concept_panel_round}
+                  panelReverted={meta.concept_panel_reverted}
                   parts={meta.requirements_contract?.parts}
                   onElaborate={
                     meta.ausarbeiten === false ? undefined : () => void handleElaborateConcept(art.id)
@@ -842,8 +1007,11 @@ export function ConversationPanel({
                 coherenceCritique={liveCritique}
                 panelGrades={cad.escalation?.concept_panel_grades}
                 panelAverage={cad.escalation?.concept_panel_average}
-                panelForced={cad.escalation?.concept_panel_forced}
+                panelReverted={cad.escalation?.concept_panel_reverted}
                 panelRound={cad.escalation?.concept_panel_round}
+                complexity={cad.escalation?.concept_complexity}
+                roster={cad.escalation?.concept_roster}
+                complexityReasons={cad.escalation?.concept_complexity_reasons}
                 parts={cad.escalation!.requirements_contract?.parts}
                 interactive
                 onDecision={(decision) => {
@@ -867,6 +1035,22 @@ export function ConversationPanel({
                   cad.resolveEscalation(decision);
                   if (activeConversationId) {
                     window.setTimeout(() => invalidateConversation(qc, activeConversationId), 400);
+                  }
+                }}
+              />
+            </div>
+          )}
+
+          {showRequirementsConfirm && cad.escalation && (
+            <div className="mr-4">
+              <RequirementsConfirmPanel
+                escalation={cad.escalation}
+                variant="inline"
+                onDecision={(decision) => {
+                  cad.resolveEscalation(decision);
+                  if (activeConversationId) {
+                    window.setTimeout(() => invalidateConversation(qc, activeConversationId), 400);
+                    window.setTimeout(() => invalidateConversation(qc, activeConversationId), 2000);
                   }
                 }}
               />

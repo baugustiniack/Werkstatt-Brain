@@ -100,6 +100,12 @@ def concept_critic_node(state: AgentState) -> AgentState:
         merged["must_ask_user"] = must[:8]
 
     open_qs = unanswered_clarification_questions(merged, answers)
+    from agents.nodes.vv_manager import _drop_unnecessary_questions
+    from agents.reference_images import resolve_reference_asset_ids
+
+    prompt = str(state.get("user_prompt") or "")
+    has_refs = bool(resolve_reference_asset_ids(state))
+    open_qs = _drop_unnecessary_questions(open_qs, prompt, has_refs=has_refs)
     for q in hard_qs:
         if q not in open_qs:
             open_qs.insert(0, q)

@@ -32,6 +32,7 @@ def verify_postgres_connection() -> None:
 def init_db() -> None:
     # Modelle registrieren (create_all)
     from app.models import agent_workflow_config as _aw  # noqa: F401
+    from app.models import inventory_folder as _if  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
     # Additive Schema-Updates ohne Alembic (bestehende DBs)
@@ -60,6 +61,18 @@ def init_db() -> None:
                 "UPDATE unprocessed_assets "
                 "SET ai_notes = notes "
                 "WHERE ai_notes IS NULL AND notes IS NOT NULL AND BTRIM(notes) <> ''"
+            )
+        )
+        connection.execute(
+            text(
+                "ALTER TABLE unprocessed_assets "
+                "ADD COLUMN IF NOT EXISTS folder_id UUID REFERENCES inventory_folders(id) ON DELETE SET NULL"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_unprocessed_assets_folder_id "
+                "ON unprocessed_assets (folder_id)"
             )
         )
     try:

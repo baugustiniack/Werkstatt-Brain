@@ -265,6 +265,48 @@ def load_reference_images_for_llm(state: AgentState, *, limit: int = 4) -> list[
     return images
 
 
+def load_concept_images_for_llm(state: AgentState, *, limit: int = 4) -> list[tuple[bytes, str]]:
+    """Konzept-Galerie (Raumsituation, Grundriss, Teile) als JPEG-Bytes für Vision-Calls."""
+    from app.services.concept_image import concept_image_path, list_concept_gallery
+    from app.services.reference_assets import prepare_image_bytes_for_vision
+
+    session_id = str(state.get("session_id") or "anonymous")
+    gallery = state.get("concept_image_urls") or list_concept_gallery(session_id)
+    images: list[tuple[bytes, str]] = []
+    seen: set[str] = set()
+    for entry in gallery:
+        if len(images) >= limit:
+            break
+        if not isinstance(entry, dict):
+            continue
+        view_key = str(entry.get("view_key") or entry.get("kind") or "overview")
+        path = concept_image_path(session_id, view=view_key)
+        if path is None or not path.is_file():
+            continue
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        prepared = prepare_image_bytes_for_vision(path)
+        if prepared:
+            images.append(prepared)
+    if images:
+        logger.info("LLM erhält %s Konzept-Ansicht(en) session=%s", len(images), session_id)
+    return images
+
+
+def load_review_images_for_llm(
+    state: AgentState,
+    *,
+    ref_limit: int = 4,
+    concept_limit: int = 3,
+) -> tuple[list[tuple[bytes, str]], int, int]:
+    """Referenz- + Konzeptbilder für Kohärenz/Jury (Referenzen zuerst)."""
+    refs = load_reference_images_for_llm(state, limit=ref_limit)
+    concepts = load_concept_images_for_llm(state, limit=concept_limit)
+    return refs + concepts, len(refs), len(concepts)
+
+
 def reference_ids_note(state: AgentState) -> str:
     ids = resolve_reference_asset_ids(state)
     if not ids:

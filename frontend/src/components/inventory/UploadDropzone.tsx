@@ -5,7 +5,7 @@ import { api } from "../../api/client";
 import type { AssetUploadResponse } from "../../api/types";
 
 /** Drag-&-Drop-Upload inkl. Kamera-Capture – mit Abbrechen. */
-export function UploadDropzone() {
+export function UploadDropzone({ folderId }: { folderId?: string | null } = {}) {
   const [isDragOver, setIsDragOver] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [result, setResult] = useState<AssetUploadResponse | null>(null);
@@ -39,11 +39,13 @@ export function UploadDropzone() {
       form.append("file", file);
       form.append("defer_process", "true");
       form.append("auto_process", "true");
+      if (folderId) form.append("folder_id", folderId);
       const data = await api.postForm<AssetUploadResponse>("/api/v1/inventory/upload", form, {
         signal: controller.signal,
       });
       setResult(data);
       queryClient.invalidateQueries({ queryKey: ["inventory-items"] });
+      queryClient.invalidateQueries({ queryKey: ["inventory-folders"] });
     } catch (err) {
       if (!(err instanceof DOMException && err.name === "AbortError")) {
         setError(err instanceof Error ? err.message : "Upload fehlgeschlagen");

@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 def _decision_is_revise(decision: object) -> bool:
     if not isinstance(decision, dict):
         return False
-    if decision.get("decision") == "revise":
+    if _decision_is_next_round(decision):
         return True
     if decision.get("approved") is False:
         return True
@@ -44,10 +44,50 @@ def _decision_feedback(decision: object) -> str:
     return str(decision.get("feedback") or decision.get("note") or decision.get("answer") or "")
 
 
+def _decision_user_grade(decision: object) -> int | None:
+    if not isinstance(decision, dict):
+        return None
+    raw = decision.get("user_grade")
+    if raw is None:
+        return None
+    try:
+        g = int(round(float(raw)))
+    except (TypeError, ValueError):
+        return None
+    if 1 <= g <= 6:
+        return g
+    return None
+
+
+def _decision_is_next_round(decision: object) -> bool:
+    if not isinstance(decision, dict):
+        return False
+    d = str(decision.get("decision") or "").strip().lower()
+    return d in {"revise", "next_round"}
+
+
 def _decision_answer(decision: object) -> str:
     if not isinstance(decision, dict):
         return ""
     return str(decision.get("answer") or decision.get("feedback") or decision.get("note") or "").strip()
+
+
+def _decision_is_skip(decision: object) -> bool:
+    if not isinstance(decision, dict):
+        return False
+    return str(decision.get("decision") or "").strip().lower() == "skip"
+
+
+def _interview_answer(decision: object) -> str:
+    """Antwort oder explizites Überspringen (kein Constraint)."""
+    from agents.design_spec import SKIP_ANSWER_CANONICAL, is_skip_answer
+
+    if _decision_is_skip(decision):
+        return SKIP_ANSWER_CANONICAL
+    raw = _decision_answer(decision)
+    if is_skip_answer(raw):
+        return SKIP_ANSWER_CANONICAL
+    return raw
 
 
 def _answered_keys(answers: list[dict[str, Any]]) -> set[str]:
@@ -91,7 +131,11 @@ def _handle_concept_approval(state: AgentState) -> AgentState:
         "concept_panel_average": state.get("concept_panel_average"),
         "concept_panel_passed": bool(state.get("concept_panel_passed")),
         "concept_panel_forced": bool(state.get("concept_panel_forced")),
+        "concept_panel_reverted": bool(state.get("concept_panel_reverted")),
         "concept_panel_round": state.get("concept_panel_round"),
+        "concept_complexity": state.get("concept_complexity"),
+        "concept_roster": state.get("concept_roster") or [],
+        "concept_complexity_reasons": state.get("concept_complexity_reasons") or [],
         "iteration_count": state.get("iteration_count", 0),
     }
     logger.info(
@@ -101,7 +145,30 @@ def _handle_concept_approval(state: AgentState) -> AgentState:
     decision = interrupt(payload)
 
     if _decision_is_revise(decision):
-        feedback = _decision_feedback(decision)
+        from agents.concept_panel import MAX_PANEL_ROUNDS, build_revision_feedback, grade_label
+
+        feedback = _decision_feedback(decision).strip()
+        user_grade = _decision_user_grade(decision)
+        grades = list(state.get("concept_panel_grades") or [])
+        round_no = int(state.get("concept_panel_round") or 0)
+        jury_block = build_revision_feedback(
+            grades,
+            average=state.get("concept_panel_average")
+            if isinstance(state.get("concept_panel_average"), (int, float))
+            else None,
+            max_rounds_reached=round_no >= MAX_PANEL_ROUNDS,
+        )
+        parts: list[str] = []
+        if user_grade is not None:
+            parts.append(
+                f"Nutzer-Bewertung: {user_grade}/6 ({grade_label(user_grade)})."
+            )
+        if feedback:
+            parts.append(f"Nutzer-Feedback:\n{feedback}")
+        parts.append(f"Jury-Feedback (Runde {state.get('concept_panel_round') or '?'}):\n{jury_block}")
+        combined = "\n\n".join(parts)
+
+        history = list(state.get("concept_panel_history") or [])
         return {
             "human_approval_required": False,
             "escalation_reason": None,
@@ -111,28 +178,35 @@ def _handle_concept_approval(state: AgentState) -> AgentState:
             "concept_panel_done": False,
             "concept_panel_passed": False,
             "concept_panel_forced": False,
-            "concept_panel_awaiting_rebuild": False,
-            "concept_panel_round": 0,
+            "concept_panel_awaiting_rebuild": True,
             "concept_panel_queue": [],
             "concept_panel_grades": [],
             "concept_panel_average": None,
+            "concept_panel_history": history,
+            "concept_panel_reverted": False,
             "panel_reviewer_id": None,
+            "last_user_grade": user_grade,
+            "coherence_critique": None,
             "current_agent": "human_escalation",
             "refinement_request": {
                 "from_agent": "human",
                 "target": "concept_builder",
                 "reason": "concept_feedback",
-                "feedback": feedback,
+                "feedback": combined,
             },
             "messages": [
-                {"role": "system", "content": "[Human Escalation] Nutzer fordert Überarbeitung des Entwurfs an."}
+                {"role": "system", "content": "[Human Escalation] Nutzer startet nächste Konzept-Runde."}
             ],
             "agent_transcript": [
                 make_entry(
                     "human_escalation",
-                    "concept_revise",
-                    "Nutzer: Entwurf überarbeiten",
-                    detail={"feedback": truncate(feedback, 800)},
+                    "concept_next_round",
+                    "Nutzer: nächste Konzept-Runde",
+                    detail={
+                        "feedback": truncate(feedback, 800),
+                        "user_grade": user_grade,
+                        "panel_round": state.get("concept_panel_round"),
+                    },
                     to_agent="concept_builder",
                 )
             ],
@@ -175,25 +249,15 @@ def _handle_requirements_approval(state: AgentState) -> AgentState:
     if pending:
         question = pending[0]
         idx = len(answers)
-        display_q = question
-        rejected = state.get("vv_last_rejected_answer") if isinstance(state.get("vv_last_rejected_answer"), dict) else None
-        prev_vague = ""
-        if rejected and str(rejected.get("question") or "").strip() == question:
-            from agents.design_spec import vague_answer_retry_hint
-
-            display_q = vague_answer_retry_hint(question)
-            prev_vague = str(rejected.get("answer") or "")
         payload = {
             "reason": "requirements_question",
-            "question": display_q,
+            "question": question,
             "question_index": idx,
             "question_total": len(questions),
             "answered_so_far": answers,
             "draft_title": vv.get("title"),
             "draft_summary": vv.get("summary"),
             "phase": phase,
-            "vague_rejected": bool(prev_vague),
-            "previous_vague_answer": prev_vague or None,
             "vv_requirements": {
                 "title": vv.get("title"),
                 "phase": phase,
@@ -203,47 +267,9 @@ def _handle_requirements_approval(state: AgentState) -> AgentState:
             "iteration_count": state.get("iteration_count", 0),
         }
         decision = interrupt(payload)
-        answer = _decision_answer(decision)
+        answer = _interview_answer(decision)
         if not answer:
             answer = "(keine Angabe)"
-
-        from agents.design_spec import is_vague_answer, vague_answer_retry_hint
-
-        if is_vague_answer(question, answer):
-            logger.info(
-                "V&V-Antwort zu ungenau – Frage bleibt offen: %s → %s",
-                truncate(question, 80),
-                truncate(answer, 40),
-            )
-            return {
-                "vv_qa_answers": answers,
-                "vv_last_rejected_answer": {"question": question, "answer": answer},
-                "human_approval_required": True,
-                "escalation_reason": "requirements_approval",
-                "vv_needs_alignment": True,
-                "current_agent": "human_escalation",
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": (
-                            "[Human Escalation] Antwort zu ungenau – bitte mit Zahl/Einheit wiederholen. "
-                            + vague_answer_retry_hint(question)
-                        ),
-                    }
-                ],
-                "agent_transcript": [
-                    make_entry(
-                        "human_escalation",
-                        "requirements_answer_vague",
-                        "V&V-Antwort abgelehnt (zu ungenau)",
-                        detail={
-                            "question": truncate(question, 200),
-                            "answer": truncate(answer, 200),
-                        },
-                        to_agent="human_escalation",
-                    )
-                ],
-            }
 
         answers = [*answers, {"question": question, "answer": answer}]
         still = _pending_questions(questions, answers)
@@ -525,7 +551,7 @@ def _handle_concept_clarification(state: AgentState) -> AgentState:
             truncate(question, 120),
         )
         decision = interrupt(payload)
-        answer = _decision_answer(decision)
+        answer = _interview_answer(decision)
         if not answer and isinstance(decision, dict) and decision.get("approved") is True:
             answer = str(decision.get("note") or "").strip() or "(keine Angabe)"
         if not answer:

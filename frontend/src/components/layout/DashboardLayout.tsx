@@ -8,15 +8,16 @@ interface PanelProps {
   title: string;
   children: ReactNode;
   className?: string;
+  bodyClassName?: string;
 }
 
-function Panel({ title, children, className = "" }: PanelProps) {
+function Panel({ title, children, className = "", bodyClassName = "overflow-y-auto" }: PanelProps) {
   return (
     <section className={`flex min-h-0 flex-col rounded-lg border border-workshop-border bg-workshop-panel ${className}`}>
       <header className="border-b border-workshop-border px-4 py-2">
         <h2 className="text-xs font-mono font-semibold tracking-widest text-workshop-muted uppercase">{title}</h2>
       </header>
-      <div className="min-h-0 flex-1 overflow-y-auto p-4">{children}</div>
+      <div className={`min-h-0 flex-1 p-4 ${bodyClassName}`}>{children}</div>
     </section>
   );
 }
@@ -85,7 +86,7 @@ export function DashboardLayout({
       <main className="min-h-0 flex-1 p-3">
         {activeTab === "workspace" && workspace}
         {activeTab === "inventory" && (
-          <Panel title="Inventory &amp; Assets" className="h-full">
+          <Panel title="Inventory &amp; Assets" className="h-full" bodyClassName="flex h-full min-h-0 flex-col overflow-hidden">
             {inventory}
           </Panel>
         )}

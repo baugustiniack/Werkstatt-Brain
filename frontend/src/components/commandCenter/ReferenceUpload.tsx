@@ -3,10 +3,11 @@ import { createPortal } from "react-dom";
 
 import { api } from "../../api/client";
 import type { AssetUploadResponse, InventoryItem } from "../../api/types";
-import { useInventoryItems } from "../../hooks/useInventoryItems";
+import { useInventoryFolders, useInventoryItems } from "../../hooks/useInventoryItems";
 import type { ReferenceMediaPreview } from "../modelViewer/ModelViewer";
 import { assetFileUrl, MediaFilePreview, resolvePreviewKind } from "../inventory/AssetPreview";
 import { compressImageForUpload, sleep } from "../../utils/compressImage";
+import { useQueryClient } from "@tanstack/react-query";
 
 const SUPPORTED_EXTENSIONS = ".step,.stp,.stl,.f3d,.png,.jpg,.jpeg,.webp,.heic,.pdf";
 /** Max. Anhänge: Bilder werden komprimiert; Prompt bekommt nur IDs (keine Vision-Texte). */
@@ -70,6 +71,7 @@ export function ReferenceUpload({
   onPreviewChange,
   clearToken = 0,
 }: ChatAttachmentsProps) {
+  const queryClient = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const [attached, setAttached] = useState<AttachedRef[]>([]);
@@ -77,13 +79,30 @@ export function ReferenceUpload({
   const [error, setError] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [search, setSearch] = useState("");
+  /** Zielordner für neue Chat-Uploads ("" = ohne Ordner). */
+  const [uploadFolderId, setUploadFolderId] = useState("");
+  /** Filter im Inventar-Picker: "all" | "unassigned" | folder UUID. */
+  const [pickerFolderFilter, setPickerFolderFilter] = useState<"all" | "unassigned" | string>("all");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [focusedId, setFocusedId] = useState<string | null>(null);
 
-  const { data, isLoading, isFetching } = useInventoryItems({
-    search: search.trim() || undefined,
-  });
+  const { data: folders = [] } = useInventoryFolders();
+  const pickerFilters = useMemo(() => {
+    const base: { search?: string; folder_id?: string | null } = {
+      search: search.trim() || undefined,
+    };
+    if (pickerFolderFilter === "unassigned") base.folder_id = null;
+    else if (pickerFolderFilter !== "all") base.folder_id = pickerFolderFilter;
+    return base;
+  }, [search, pickerFolderFilter]);
+  const { data, isLoading, isFetching } = useInventoryItems(pickerFilters);
   const items = data?.items ?? [];
+
+  const folderNameById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const f of folders) map.set(f.id, f.name);
+    return map;
+  }, [folders]);
 
   const selectedItems = useMemo(
     () => items.filter((i) => selectedIds.has(i.id)),
@@ -201,6 +220,7 @@ export function ReferenceUpload({
         form.append("defer_process", "true");
         // Keine Sofort-Vision-Kette für Chat-Anhänge (RAM-Schutz); Konzept nutzt Bild-IDs
         form.append("auto_process", "false");
+        if (uploadFolderId) form.append("folder_id", uploadFolderId);
         const result = await api.postForm<AssetUploadResponse>("/api/v1/inventory/upload", form, {
           signal: controller.signal,
         });
@@ -226,6 +246,8 @@ export function ReferenceUpload({
         }
       }
       pushAttached(refs);
+      queryClient.invalidateQueries({ queryKey: ["inventory-items"] });
+      queryClient.invalidateQueries({ queryKey: ["inventory-folders"] });
     } catch (err) {
       for (const r of refs) {
         if (r.localObjectUrl) URL.revokeObjectURL(r.localObjectUrl);
@@ -313,6 +335,25 @@ export function ReferenceUpload({
                 Eintrag tippen → Bild rechts im Model Viewer · Checkbox = Mehrfachauswahl
               </p>
             </div>
+            <select
+              value={pickerFolderFilter}
+              onChange={(e) => {
+                setPickerFolderFilter(e.target.value);
+                setFocusedId(null);
+                setSelectedIds(new Set());
+              }}
+              className="rounded-md border border-workshop-border bg-workshop-panel px-2 py-2 text-sm text-workshop-text focus:border-workshop-accent focus:outline-none"
+              aria-label="Ordner filtern"
+            >
+              <option value="all">Alle Ordner</option>
+              <option value="unassigned">Ohne Ordner</option>
+              {folders.map((folder) => (
+                <option key={folder.id} value={folder.id}>
+                  {folder.name}
+                  {folder.item_count > 0 ? ` (${folder.item_count})` : ""}
+                </option>
+              ))}
+            </select>
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
@@ -393,6 +434,11 @@ export function ReferenceUpload({
                         <span className="min-w-0 flex-1 truncate text-[11px] text-workshop-text">
                           {itemLabel(item)}
                         </span>
+                        {item.folder_id && folderNameById.get(item.folder_id) && (
+                          <span className="shrink-0 truncate text-[9px] text-workshop-muted">
+                            {folderNameById.get(item.folder_id)}
+                          </span>
+                        )}
                       </label>
                     </div>
                   );
@@ -544,7 +590,23 @@ export function ReferenceUpload({
           </button>
         </div>
       ) : (
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="flex items-center gap-1.5 text-[11px] text-workshop-muted">
+            <span className="shrink-0">Ordner</span>
+            <select
+              value={uploadFolderId}
+              onChange={(e) => setUploadFolderId(e.target.value)}
+              className="max-w-[10rem] rounded-md border border-workshop-border bg-workshop-bg px-1.5 py-1 text-xs text-workshop-text focus:border-workshop-accent focus:outline-none"
+              title="Neue Uploads landen in diesem Inventar-Ordner"
+            >
+              <option value="">Ohne Ordner</option>
+              {folders.map((folder) => (
+                <option key={folder.id} value={folder.id}>
+                  {folder.name}
+                </option>
+              ))}
+            </select>
+          </label>
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}

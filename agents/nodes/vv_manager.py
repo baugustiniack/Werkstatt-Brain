@@ -41,6 +41,9 @@ Regeln:
 - phase=manufacturing: prüfbare Fertigungs-/Abnahmekriterien, Maschinenbezug.
 - open_questions: konkrete Klärungsfragen an den Nutzer (eine Sache pro Frage, Deutsch).
   Bei phase=concept: 0–5 Fragen – nur zu Dingen, die NICHT schon klar sind.
+  Außenmaße im Prompt (z.B. 2000x600x2300 mm) gelten als gegeben – NICHT nach Breite/Tiefe/Höhe
+  und NICHT nach optionalem Freiraum/Abstand zu Schreibtisch, Couch, Regal fragen, es sei denn
+  der Nutzer hat das selbst als Anforderung genannt.
   Bei phase=design|manufacturing: KEINE Fragen wiederholen, die in concept schon geklärt
   wurden (Couch, Regalwand, Maße, Platzierung, Bestand). open_questions leer lassen,
   außer bei wirklich neuen Fertigungs-/Toleranzlücken.
@@ -128,6 +131,78 @@ def _is_redundant_room_dimension_question(question: str) -> bool:
     if re.search(r"raumm[aä]ß|zimmergröße|raumgröße|grundriss.*maß", q):
         return True
     return False
+
+
+_OUTER_DIM_RE = re.compile(
+    r"\d+(?:[.,]\d+)?\s*(?:x|×)\s*\d+(?:[.,]\d+)?\s*(?:x|×)\s*\d+(?:[.,]\d+)?\s*(?:mm|cm|m)\b",
+    re.IGNORECASE,
+)
+
+
+def _prompt_has_outer_dims(prompt: str) -> bool:
+    return bool(_OUTER_DIM_RE.search(prompt or ""))
+
+
+def _is_optional_clearance_question(question: str) -> bool:
+    """Abstand/Freiraum zu vorhandenem Mobiliar – optional, wenn Maße schon stehen."""
+    q = (question or "").lower()
+    return any(
+        k in q
+        for k in (
+            "freiraum",
+            "abstand",
+            "lücke zwischen",
+            "luecke zwischen",
+            "platz zwischen",
+            "zwischen der neuen",
+            "zwischen dem neuen",
+            "zum schreibtisch",
+            "zur couch",
+            "zum sofa",
+            "marshall",
+            "mindestens bleiben",
+            "gangbreite",
+            "durchgang",
+        )
+    )
+
+
+def _is_redundant_outer_dim_question(question: str, prompt: str) -> bool:
+    if not _prompt_has_outer_dims(prompt):
+        return False
+    q = (question or "").lower()
+    return any(
+        k in q
+        for k in (
+            "außenmaß",
+            "aussenmass",
+            "außenmasse",
+            "aussenmaße",
+            "abmessung",
+            "breite ×",
+            "breite x",
+            "breite × höhe",
+            "welche maße",
+            "welche masse",
+        )
+    )
+
+
+def _drop_unnecessary_questions(questions: list[str], prompt: str, *, has_refs: bool) -> list[str]:
+    out: list[str] = []
+    dims_given = _prompt_has_outer_dims(prompt)
+    for q in questions:
+        text = str(q).strip()
+        if not text:
+            continue
+        if has_refs and _is_redundant_room_dimension_question(text):
+            continue
+        if dims_given and (
+            _is_optional_clearance_question(text) or _is_redundant_outer_dim_question(text, prompt)
+        ):
+            continue
+        out.append(text)
+    return out
 
 
 def _next_phase(current: str | None, *, concept_approved: bool, has_mfg_plan: bool) -> str:
@@ -226,10 +301,14 @@ def _heuristic_requirements(
         ]
     else:
         questions = [
-            "Welche Außenmaße (Breite × Höhe × Tiefe in mm oder cm) soll das Werkstück ungefähr haben?",
             "Welches Material bevorzugst du (z.B. Multiplex, Massivholz, MDF) und welche Plattenstärke?",
             "Wo wird das Stück aufgestellt bzw. eingebaut (Raum, Wand, freistehend)?",
         ]
+        if not _prompt_has_outer_dims(prompt):
+            questions.insert(
+                0,
+                "Welche Außenmaße (Breite × Höhe × Tiefe in mm oder cm) soll das Werkstück ungefähr haben?",
+            )
     if phase == "design":
         reqs.append(
             {
@@ -579,13 +658,12 @@ def vv_manager_node(state: AgentState) -> AgentState:
     prior_qa = _prior_qa_pairs(state)
     consulted_phases = list(state.get("vv_consulted_phases") or [])
 
-    # Redundante Raummaß-Fragen entfernen, wenn Referenzen/Grundriss da sind
-    if has_refs:
-        filtered = [q for q in questions if not _is_redundant_room_dimension_question(q)]
-        dropped = len(questions) - len(filtered)
-        if dropped:
-            logger.info("V&V: %s Raummaß-Frage(n) wegen Referenzfotos/Grundriss verworfen", dropped)
-        questions = filtered
+    # Redundante Raum-/Abstandsfragen entfernen, wenn Maße oder Referenzen schon da sind
+    filtered = _drop_unnecessary_questions(questions, prompt, has_refs=has_refs)
+    dropped = len(questions) - len(filtered)
+    if dropped:
+        logger.info("V&V: %s überflüssige Frage(n) verworfen (Maße/Referenzen schon gegeben)", dropped)
+    questions = filtered
 
     before = len(questions)
     questions = _filter_new_questions(questions, prior_qa)
@@ -606,6 +684,7 @@ def vv_manager_node(state: AgentState) -> AgentState:
                 )["open_questions"],
                 prior_qa,
             )
+            questions = _drop_unnecessary_questions(questions, prompt, has_refs=has_refs)
         result["needs_user_alignment"] = True
     else:
         # design/manufacturing: kein zweites Freigabe-Ritual (Logs: gleiche Fragen 3×)
@@ -631,10 +710,10 @@ def vv_manager_node(state: AgentState) -> AgentState:
 
     if coherence and target_phase == "concept":
         extra = [str(q).strip() for q in (coherence.get("must_ask_user") or []) if str(q).strip()]
+        extra = _drop_unnecessary_questions(extra, prompt, has_refs=has_refs)
         for q in extra:
             if (
                 q not in questions
-                and not (has_refs and _is_redundant_room_dimension_question(q))
                 and not _question_covered_by_prior(q, prior_qa)
             ):
                 questions.append(q)

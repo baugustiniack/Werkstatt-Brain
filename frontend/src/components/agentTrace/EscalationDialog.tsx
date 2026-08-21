@@ -96,10 +96,7 @@ export function ClarificationPanel({
 }: EscalationDialogProps & { variant?: "modal" | "inline" }) {
   const [answer, setAnswer] = useState("");
   const reason = normalizeReason(escalation.reason);
-  const isConceptClarify =
-    reason === "concept_clarification" ||
-    String(escalation.phase || "").toLowerCase().includes("concept") ||
-    String(escalation.phase || "").toLowerCase().includes("klär");
+  const isConceptClarify = reason === "concept_clarification";
 
   const critique = escalation.coherence_critique;
   const openFromCritique = [
@@ -135,24 +132,30 @@ export function ClarificationPanel({
     <div
       className={
         variant === "inline"
-          ? "flex w-full flex-col overflow-hidden rounded-lg border border-workshop-accent bg-workshop-panel shadow-md"
+          ? "mr-8 flex w-full flex-col overflow-hidden rounded-lg border border-workshop-border bg-workshop-panel px-3 py-2"
           : "flex max-h-[90vh] w-full max-w-xl flex-col overflow-hidden rounded-lg border border-workshop-accent bg-workshop-panel shadow-xl"
       }
     >
-      <div className="border-b border-workshop-border px-4 py-3 sm:px-5">
-        <h3 className="text-sm font-semibold text-workshop-accent">
+      <div className={variant === "inline" ? "mb-2" : "border-b border-workshop-border px-4 py-3 sm:px-5"}>
+        <h3 className="text-xs font-semibold text-workshop-text">
           {isConceptClarify
-            ? `Konzept-Klärung – Frage ${idx} von ${total}`
-            : `V&V Klärung – Frage ${idx} von ${total}`}
+            ? `Konzept-Klärung · Frage ${idx}/${total}`
+            : `V&V · Frage ${idx}/${total}`}
         </h3>
         <p className="mt-0.5 text-[11px] text-workshop-muted">
           {isConceptClarify
-            ? `Offene Punkte zu „${title}“ müssen geklärt werden, bevor das Konzept freigegeben wird.`
-            : "Bitte beantworte die Fragen nacheinander."}
+            ? `Offene Punkte zu „${title}“.`
+            : "Bitte im Chat beantworten – eine Frage nach der anderen."}
         </p>
       </div>
 
-      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-3 sm:px-5">
+      <div
+        className={
+          variant === "inline"
+            ? "min-h-0 flex-1 space-y-2 overflow-y-auto"
+            : "min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-3 sm:px-5"
+        }
+      >
         {(parts.length > 0 || previewUrl) && (
           <div className="rounded border border-workshop-border/70 bg-black/20 p-2">
             <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-workshop-muted">
@@ -222,8 +225,7 @@ export function ClarificationPanel({
           </div>
         )}
 
-        <div className="rounded-md border border-workshop-accent/40 bg-workshop-accent/10 px-3 py-2">
-          <div className="mb-1 text-[10px] font-semibold uppercase text-workshop-accent">Aktuelle Frage</div>
+        <div className="rounded-md border border-workshop-border/70 bg-workshop-bg/50 px-2.5 py-2">
           <p className="text-sm leading-snug text-workshop-text">{question}</p>
         </div>
 
@@ -231,16 +233,22 @@ export function ClarificationPanel({
           value={answer}
           onChange={(event) => setAnswer(event.target.value)}
           placeholder="Deine Antwort…"
-          rows={3}
+          rows={2}
           autoFocus
           className="w-full resize-none rounded-md border border-workshop-border bg-workshop-bg p-2 text-xs text-workshop-text placeholder:text-workshop-muted focus:border-workshop-accent focus:outline-none"
         />
       </div>
 
-      <div className="flex justify-end gap-2 border-t border-workshop-border px-4 py-3 sm:px-5">
+      <div
+        className={
+          variant === "inline"
+            ? "mt-2 flex justify-end gap-2"
+            : "flex justify-end gap-2 border-t border-workshop-border px-4 py-3 sm:px-5"
+        }
+      >
         <button
           type="button"
-          onClick={() => onDecision({ decision: "answer", answer: "(übersprungen)" })}
+          onClick={() => onDecision({ decision: "skip", answer: "(übersprungen – kein Constraint)" })}
           className="rounded-md border border-workshop-border px-3 py-1.5 text-xs font-semibold text-workshop-muted hover:bg-workshop-bg"
         >
           Überspringen
@@ -274,7 +282,12 @@ function ClarificationDialog({ escalation, onDecision }: EscalationDialogProps) 
   return <ClarificationPanel escalation={escalation} onDecision={onDecision} variant="modal" />;
 }
 
-function RequirementsConfirmDialog({ escalation, onDecision }: EscalationDialogProps) {
+/** Anforderungsliste bestätigen – inline im Chat oder Modal (Legacy). */
+export function RequirementsConfirmPanel({
+  escalation,
+  onDecision,
+  variant = "inline",
+}: EscalationDialogProps & { variant?: "modal" | "inline" }) {
   const [mode, setMode] = useState<"view" | "revise">("view");
   const [feedback, setFeedback] = useState("");
   const vv = escalation.vv_requirements;
@@ -284,94 +297,112 @@ function RequirementsConfirmDialog({ escalation, onDecision }: EscalationDialogP
   const requirements = vv?.requirements ?? [];
   const qa = escalation.qa_answers ?? [];
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-      <div className="flex max-h-[85vh] w-full max-w-2xl flex-col rounded-lg border border-workshop-accent bg-workshop-panel p-5 shadow-xl">
-        <h3 className="mb-1 text-sm font-semibold text-workshop-accent">
-          Anforderungsliste bestätigen ({phase}): {title}
+  const body = (
+    <div
+      className={
+        variant === "inline"
+          ? "mr-8 flex w-full flex-col overflow-hidden rounded-lg border border-workshop-border bg-workshop-panel px-3 py-2"
+          : "flex max-h-[85vh] w-full max-w-2xl flex-col rounded-lg border border-workshop-accent bg-workshop-panel p-5 shadow-xl"
+      }
+    >
+      <div className="mb-2">
+        <h3 className="text-xs font-semibold text-workshop-text">
+          V&V · Anforderungsliste ({phase}): {title}
         </h3>
-        <p className="mb-3 text-xs text-workshop-muted">
-          Aus deinen Antworten wurde die vollständige Anforderungsliste erstellt. Bitte bestätigen oder anpassen.
+        <p className="mt-0.5 text-[11px] text-workshop-muted">
+          Bitte im Chat prüfen und freigeben oder anpassen.
         </p>
+      </div>
 
-        {summary && <p className="mb-3 text-xs text-workshop-text">{summary}</p>}
+      {summary && <p className="mb-2 text-[11px] leading-snug text-workshop-text">{summary}</p>}
 
-        {qa.length > 0 && (
-          <details className="mb-3 rounded-md border border-workshop-border/60 p-2 text-[11px] text-workshop-muted">
-            <summary className="cursor-pointer font-semibold text-workshop-text">Bisherige Antworten</summary>
-            <ul className="mt-1 list-inside list-disc">
-              {qa.map((item, i) => (
-                <li key={i}>
-                  {item.question}: {item.answer}
-                </li>
-              ))}
-            </ul>
-          </details>
+      {qa.length > 0 && (
+        <details className="mb-2 rounded-md border border-workshop-border/60 p-2 text-[11px] text-workshop-muted">
+          <summary className="cursor-pointer font-semibold text-workshop-text">Deine Antworten</summary>
+          <ul className="mt-1 list-inside list-disc">
+            {qa.map((item, i) => (
+              <li key={i}>
+                {item.question}: {item.answer}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+
+      <div className="mb-2 max-h-40 overflow-y-auto rounded border border-workshop-border/70 bg-black/20 p-2 text-[11px]">
+        {requirements.map((req, i) => (
+          <div key={req.id || i} className="mb-1.5 border-b border-workshop-border/40 pb-1 last:border-0">
+            <span className="font-semibold text-workshop-accent">{req.id || `R${i + 1}`}</span>{" "}
+            <span className="text-workshop-text">{req.text}</span>
+            {req.priority ? (
+              <span className="ml-1 text-[10px] text-workshop-muted">({req.priority})</span>
+            ) : null}
+          </div>
+        ))}
+      </div>
+
+      {mode === "revise" && (
+        <textarea
+          value={feedback}
+          onChange={(e) => setFeedback(e.target.value)}
+          placeholder="Was soll an der Liste geändert werden?"
+          rows={2}
+          className="mb-2 w-full resize-none rounded-md border border-workshop-border bg-workshop-bg p-2 text-xs"
+        />
+      )}
+
+      <div className="flex justify-end gap-2">
+        {mode === "view" ? (
+          <>
+            <button
+              type="button"
+              onClick={() => setMode("revise")}
+              className="rounded-md border border-workshop-border px-3 py-1.5 text-xs font-semibold text-workshop-text hover:bg-workshop-bg"
+            >
+              Anpassen
+            </button>
+            <button
+              type="button"
+              onClick={() => onDecision({ decision: "approve" })}
+              className="rounded-md bg-workshop-accent px-3 py-1.5 text-xs font-semibold text-workshop-bg"
+            >
+              Anforderungsliste freigeben
+            </button>
+          </>
+        ) : (
+          <>
+            <button
+              type="button"
+              onClick={() => setMode("view")}
+              className="rounded-md border border-workshop-border px-3 py-1.5 text-xs font-semibold text-workshop-muted"
+            >
+              Zurück
+            </button>
+            <button
+              type="button"
+              disabled={!feedback.trim()}
+              onClick={() => onDecision({ decision: "revise", feedback: feedback.trim() })}
+              className="rounded-md bg-workshop-accent px-3 py-1.5 text-xs font-semibold text-workshop-bg disabled:opacity-40"
+            >
+              Anpassung senden
+            </button>
+          </>
         )}
-
-        <div className="mb-3 max-h-48 overflow-y-auto rounded border border-workshop-border bg-black/20 p-2 text-xs">
-          {requirements.map((req, i) => (
-            <div key={req.id || i} className="mb-1.5 border-b border-workshop-border/40 pb-1 last:border-0">
-              <span className="font-semibold text-workshop-accent">{req.id || `R${i + 1}`}</span>{" "}
-              <span className="text-workshop-text">{req.text}</span>
-              {req.priority ? (
-                <span className="ml-1 text-[10px] text-workshop-muted">({req.priority})</span>
-              ) : null}
-            </div>
-          ))}
-        </div>
-
-        {mode === "revise" && (
-          <textarea
-            value={feedback}
-            onChange={(e) => setFeedback(e.target.value)}
-            placeholder="Was soll an der Liste geändert werden?"
-            rows={3}
-            className="mb-3 w-full resize-none rounded-md border border-workshop-border bg-workshop-bg p-2 text-xs"
-          />
-        )}
-
-        <div className="flex justify-end gap-2">
-          {mode === "view" ? (
-            <>
-              <button
-                type="button"
-                onClick={() => setMode("revise")}
-                className="rounded-md border border-workshop-border px-3 py-1.5 text-xs font-semibold"
-              >
-                Anpassen
-              </button>
-              <button
-                type="button"
-                onClick={() => onDecision({ decision: "approve" })}
-                className="rounded-md bg-workshop-accent px-3 py-1.5 text-xs font-semibold text-workshop-bg"
-              >
-                Anforderungsliste freigeben
-              </button>
-            </>
-          ) : (
-            <>
-              <button
-                type="button"
-                onClick={() => setMode("view")}
-                className="rounded-md border border-workshop-border px-3 py-1.5 text-xs font-semibold text-workshop-muted"
-              >
-                Abbrechen
-              </button>
-              <button
-                type="button"
-                disabled={!feedback.trim()}
-                onClick={() => onDecision({ decision: "revise", feedback: feedback.trim() })}
-                className="rounded-md bg-workshop-accent px-3 py-1.5 text-xs font-semibold text-workshop-bg disabled:opacity-40"
-              >
-                Anpassung senden
-              </button>
-            </>
-          )}
-        </div>
       </div>
     </div>
   );
+
+  if (variant === "inline") {
+    return body;
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">{body}</div>
+  );
+}
+
+function RequirementsConfirmDialog({ escalation, onDecision }: EscalationDialogProps) {
+  return <RequirementsConfirmPanel escalation={escalation} onDecision={onDecision} variant="modal" />;
 }
 
 /** Human-in-the-Loop-Dialog. */

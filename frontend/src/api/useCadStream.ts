@@ -39,6 +39,16 @@ export interface UseCadStreamResult {
   errorMessage: string | null;
   conceptSketchSvg: string | null;
   conceptImageUrl: string | null;
+  conceptImageUrls: NonNullable<EscalationPayload["concept_image_urls"]>;
+  conceptTitle: string | null;
+  conceptPanelGrades: NonNullable<EscalationPayload["concept_panel_grades"]>;
+  conceptPanelAverage: number | null;
+  conceptPanelRound: number;
+  conceptPanelQueue: string[];
+  panelReviewerId: string | null;
+  conceptRoster: string[];
+  conceptPanelAwaitingRebuild: boolean;
+  conceptPanelReverted: boolean;
   agentTranscript: AgentTranscriptEntry[];
   completedParts: CompletedPart[];
   currentPartIndex: number;
@@ -137,6 +147,17 @@ export function useCadStream(): UseCadStreamResult {
             ) {
               next.completed_parts = prev.completed_parts;
             }
+            if (
+              Array.isArray(message.state.concept_image_urls) &&
+              (message.state.concept_image_urls as unknown[]).length === 0 &&
+              Array.isArray(prev.concept_image_urls) &&
+              (prev.concept_image_urls as unknown[]).length > 0
+            ) {
+              next.concept_image_urls = prev.concept_image_urls;
+            }
+            if (!message.state.concept_image_url && prev.concept_image_url) {
+              next.concept_image_url = prev.concept_image_url;
+            }
             return next;
           });
           break;
@@ -178,6 +199,17 @@ export function useCadStream(): UseCadStreamResult {
             };
           }
           setEscalation(esc);
+          setLatestState((prev) => ({
+            ...prev,
+            ...(esc.concept_image_url ? { concept_image_url: esc.concept_image_url } : {}),
+            ...(esc.concept_image_urls ? { concept_image_urls: esc.concept_image_urls } : {}),
+            ...(esc.concept_panel_grades ? { concept_panel_grades: esc.concept_panel_grades } : {}),
+            ...(esc.concept_panel_average != null ? { concept_panel_average: esc.concept_panel_average } : {}),
+            ...(esc.concept_panel_round != null ? { concept_panel_round: esc.concept_panel_round } : {}),
+            ...(esc.concept_roster ? { concept_roster: esc.concept_roster } : {}),
+            ...(esc.concept_panel_reverted != null ? { concept_panel_reverted: esc.concept_panel_reverted } : {}),
+            ...(esc.requirements_contract ? { requirements_contract: esc.requirements_contract } : {}),
+          }));
           break;
         }
         case "final":
@@ -278,6 +310,16 @@ export function useCadStream(): UseCadStreamResult {
           completed_parts?: CompletedPart[] | null;
           current_part_index?: number;
           concept_image_url?: string | null;
+          concept_image_urls?: EscalationPayload["concept_image_urls"];
+          concept_panel_grades?: EscalationPayload["concept_panel_grades"];
+          concept_panel_average?: number | null;
+          concept_panel_round?: number | null;
+          concept_panel_queue?: string[] | null;
+          panel_reviewer_id?: string | null;
+          concept_roster?: string[] | null;
+          concept_panel_awaiting_rebuild?: boolean | null;
+          concept_panel_reverted?: boolean | null;
+          agent_transcript?: AgentTranscriptEntry[] | null;
           requirements_contract?: RequirementsContract | null;
         }>("/api/v1/cad/resume-run", {
           session_id: pausedId,
@@ -287,12 +329,23 @@ export function useCadStream(): UseCadStreamResult {
         setSessionId(pending.session_id);
         setPausedSessionId(null);
         pausedSessionIdRef.current = null;
-        // Fertige Teile sofort wieder in den Viewer laden
+        // Fertige Teile + Konzept-Stand sofort wieder in den Viewer laden
         setLatestState((prev) => ({
           ...prev,
           completed_parts: pending.completed_parts ?? prev.completed_parts ?? [],
           current_part_index: pending.current_part_index ?? prev.current_part_index ?? 0,
           concept_image_url: pending.concept_image_url ?? prev.concept_image_url,
+          concept_image_urls: pending.concept_image_urls ?? prev.concept_image_urls,
+          concept_panel_grades: pending.concept_panel_grades ?? prev.concept_panel_grades,
+          concept_panel_average: pending.concept_panel_average ?? prev.concept_panel_average,
+          concept_panel_round: pending.concept_panel_round ?? prev.concept_panel_round,
+          concept_panel_queue: pending.concept_panel_queue ?? prev.concept_panel_queue,
+          panel_reviewer_id: pending.panel_reviewer_id ?? prev.panel_reviewer_id,
+          concept_roster: pending.concept_roster ?? prev.concept_roster,
+          concept_panel_awaiting_rebuild:
+            pending.concept_panel_awaiting_rebuild ?? prev.concept_panel_awaiting_rebuild,
+          concept_panel_reverted: pending.concept_panel_reverted ?? prev.concept_panel_reverted,
+          agent_transcript: pending.agent_transcript ?? prev.agent_transcript,
           requirements_contract: pending.requirements_contract ?? prev.requirements_contract,
         }));
         setStatus("running");
@@ -374,7 +427,10 @@ export function useCadStream(): UseCadStreamResult {
     prevSocket?.close();
   }, [sessionId]);
 
-  const effectiveState = (result as unknown as Record<string, unknown>) ?? latestState;
+  const effectiveState = useMemo(
+    () => ({ ...((result as Record<string, unknown> | null) ?? {}), ...latestState }),
+    [latestState, result],
+  );
 
   const conceptSketchSvg = useMemo(
     () => (effectiveState.concept_sketch_svg as string | undefined) ?? escalation?.concept_sketch_svg ?? null,
@@ -383,6 +439,47 @@ export function useCadStream(): UseCadStreamResult {
   const conceptImageUrl = useMemo(
     () => (effectiveState.concept_image_url as string | undefined) ?? escalation?.concept_image_url ?? null,
     [effectiveState, escalation],
+  );
+  const conceptImageUrls = useMemo(() => {
+    const fromState = effectiveState.concept_image_urls as EscalationPayload["concept_image_urls"];
+    const fromEsc = escalation?.concept_image_urls;
+    return (fromState?.length ? fromState : fromEsc) ?? [];
+  }, [effectiveState, escalation]);
+  const conceptTitle = useMemo(() => {
+    const contract = effectiveState.requirements_contract as RequirementsContract | undefined;
+    return contract?.project_title || escalation?.requirements_contract?.project_title || null;
+  }, [effectiveState, escalation]);
+  const conceptPanelGrades = useMemo(() => {
+    const fromState = effectiveState.concept_panel_grades as EscalationPayload["concept_panel_grades"];
+    const fromEsc = escalation?.concept_panel_grades;
+    return (fromState?.length ? fromState : fromEsc) ?? [];
+  }, [effectiveState, escalation]);
+  const conceptPanelAverage = useMemo(() => {
+    const fromState = effectiveState.concept_panel_average;
+    if (typeof fromState === "number") return fromState;
+    return escalation?.concept_panel_average ?? null;
+  }, [effectiveState, escalation]);
+  const conceptPanelRound = useMemo(
+    () => Number(effectiveState.concept_panel_round || escalation?.concept_panel_round || 0),
+    [effectiveState, escalation],
+  );
+  const conceptPanelQueue = useMemo(() => {
+    const q = effectiveState.concept_panel_queue;
+    return Array.isArray(q) ? q.map(String) : [];
+  }, [effectiveState]);
+  const panelReviewerId = useMemo(() => {
+    const id = effectiveState.panel_reviewer_id;
+    return typeof id === "string" && id ? id : null;
+  }, [effectiveState]);
+  const conceptRoster = useMemo(() => {
+    const fromState = effectiveState.concept_roster;
+    const fromEsc = escalation?.concept_roster;
+    const list = (Array.isArray(fromState) && fromState.length ? fromState : fromEsc) ?? [];
+    return list.map(String);
+  }, [effectiveState, escalation]);
+  const conceptPanelAwaitingRebuild = Boolean(effectiveState.concept_panel_awaiting_rebuild);
+  const conceptPanelReverted = Boolean(
+    effectiveState.concept_panel_reverted ?? escalation?.concept_panel_reverted,
   );
   const agentTranscript = useMemo(() => {
     const fromResult = (result as CadWorkflowResult | null)?.agent_transcript;
@@ -411,6 +508,16 @@ export function useCadStream(): UseCadStreamResult {
     errorMessage,
     conceptSketchSvg,
     conceptImageUrl,
+    conceptImageUrls,
+    conceptTitle,
+    conceptPanelGrades,
+    conceptPanelAverage,
+    conceptPanelRound,
+    conceptPanelQueue,
+    panelReviewerId,
+    conceptRoster,
+    conceptPanelAwaitingRebuild,
+    conceptPanelReverted,
     agentTranscript,
     completedParts,
     currentPartIndex,

@@ -11,6 +11,7 @@ from app.models.execution_log import ExecutionLog
 from app.models.project_cad import ProjectCad
 from app.models.stock_material import StockMaterial
 from app.models.tool import Tool, ToolStatus
+from app.models.inventory_folder import InventoryFolder
 from app.models.unprocessed_asset import AssetFileType, AssetSource, AssetStatus, UnprocessedAsset
 
 __all__ = [
@@ -24,6 +25,7 @@ __all__ = [
     "ConversationArtifact",
     "ConversationMessage",
     "ExecutionLog",
+    "InventoryFolder",
     "ProjectCad",
     "StockMaterial",
     "Tool",

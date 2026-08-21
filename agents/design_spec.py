@@ -19,11 +19,17 @@ logger = logging.getLogger(__name__)
 DoorType = Literal["sliding_2", "sliding_3", "hinged", "none", "unknown"]
 
 _VAGUE_ONLY = re.compile(
-    r"^(ausreichend|egal|weiss?\s*nicht|weiß\s*nicht|irgendwie|normal|passt|"
-    r"ok|okay|ja|nein|vielleicht|keine\s*ahnung|spaeter|später|"
-    r"\(übersprungen\)|\(uebersprungen\)|-|\.|n/?a)$",
+    r"^(ausreichend|weiss?\s*nicht|weiß\s*nicht|irgendwie|normal|passt|"
+    r"ok|okay|ja|nein|vielleicht|keine\s*ahnung|spaeter|später|-|\.)$",
     re.IGNORECASE,
 )
+_SKIP_ANSWER = re.compile(
+    r"^\(?\s*(?:übersprungen|uebersprungen|skip(?:ped)?|keine\s*angabe|"
+    r"egal|ist\s*egal|mir\s*egal|kein\s*constraint|nicht\s*relevant|"
+    r"n/?a|—|–)\s*(?:[-–—].*)?\)?$",
+    re.IGNORECASE,
+)
+SKIP_ANSWER_CANONICAL = "(übersprungen – kein Constraint, kein Maß erfinden)"
 _HAS_NUMBER = re.compile(r"\d+(?:[.,]\d+)?")
 _MEASURE_HINT = re.compile(
     r"(mm|cm|m\b|maß|mass|höhe|hoehe|breite|tiefe|länge|laenge|decke|"
@@ -153,9 +159,22 @@ def load_design_spec(raw: Any) -> DesignSpec | None:
         return None
 
 
+def is_skip_answer(answer: str) -> bool:
+    """User will die Frage nicht beantworten / kein Constraint setzen."""
+    a = (answer or "").strip()
+    if not a:
+        return False
+    if _SKIP_ANSWER.match(a):
+        return True
+    low = a.lower()
+    return low.startswith("(übersprungen") or low.startswith("(uebersprungen")
+
+
 def is_vague_answer(question: str, answer: str) -> bool:
     """True wenn die Antwort für eine Maß-/Mengenfrage zu ungenau ist."""
     a = (answer or "").strip()
+    if is_skip_answer(a):
+        return False
     if not a:
         return True
     if _VAGUE_ONLY.match(a):

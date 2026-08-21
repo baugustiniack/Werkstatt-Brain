@@ -28,22 +28,22 @@ DEFAULT_EDGES: list[dict[str, Any]] = [
     {
         "from": "supervisor",
         "to": "flexible_specialist",
-        "when": "noch nicht flexible_consulted und Agent enabled",
+        "when": "Roster enthält flexible_specialist (Komplexität medium/high) und noch nicht consulted",
     },
     {
         "from": "supervisor",
         "to": "interior_architect",
-        "when": "noch nicht interior_consulted und Agent enabled",
+        "when": "Roster enthält interior_architect (Komplexität high / Raum) und noch nicht consulted",
     },
     {
         "from": "supervisor",
         "to": "custom_agent_1",
-        "when": "Leer-Agent 1 enabled und noch nicht in empty_agents_consulted",
+        "when": "Komplexität high, Leer-Agent 1 enabled und noch nicht consulted",
     },
     {
         "from": "supervisor",
         "to": "custom_agent_2",
-        "when": "Leer-Agent 2 enabled und noch nicht in empty_agents_consulted",
+        "when": "Komplexität high, Leer-Agent 2 enabled und noch nicht consulted",
     },
     {
         "from": "supervisor",
@@ -180,15 +180,16 @@ DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
         "display_name": "Supervisor",
         "role": "Zentraler Orchestrator und Router; stellt das Flexible-Specialist-Profil zu.",
         "responsibilities": [
-            "Entscheidet den nächsten Sub-Agenten anhand des States",
-            "Orchestriert Flexible → V&V → Concept → Design-V&V → Inventory → Fertigung → Manufacturing-V&V → 3D → Montage",
+            "Stuft die Konzept-Komplexität ein (low/medium/high) und legt das Agenten-Roster fest",
+            "Entscheidet den nächsten Sub-Agenten anhand des States und des Rosters",
+            "Orchestriert nur die nötigen Agenten → V&V → Concept → Jury → Design → Fertigung → 3D",
             "Sichert fertige Teile in completed_parts und rückt zum nächsten Teil vor",
         ],
         "inputs": ["gesamter AgentState"],
-        "outputs": ["Routing-Entscheidung", "completed_parts", "iteration_count"],
+        "outputs": ["concept_complexity", "concept_roster", "Routing-Entscheidung", "completed_parts"],
         "properties": {
             "guidance": "",
-            "notes": "Routing ist codegesteuert; guidance dient der Meta-Coach-Dokumentation.",
+            "notes": "Komplexität steuert Intake + Jury. Vorstellung nur ohne Note ≥5 (kein Pflicht-Schnitt 2,0). Max. 4 Runden; schlechterer Schnitt → Revert. Komplexität darf nur steigen.",
         },
     },
     "flexible_specialist": {
@@ -203,7 +204,7 @@ DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
         "outputs": ["flexible_specialist_profile", "advisory_notes", "flexible_advice"],
         "properties": {
             "guidance": "",
-            "notes": "Optional; wenn deaktiviert, setzt der Supervisor flexible_consulted und überspringt.",
+            "notes": "Nur bei Komplexität medium/high im Roster; sonst überspringt der Supervisor.",
         },
     },
     "interior_architect": {
@@ -218,7 +219,7 @@ DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
         "outputs": ["interior_brief", "interior_consulted", "advisory_notes"],
         "properties": {
             "guidance": "",
-            "notes": "Optional; deaktiviert → Concept Builder nutzt Heuristik für Ansichten.",
+            "notes": "Nur bei Komplexität high (Raum/Fotos/Möbel) im Roster; sonst überspringt der Supervisor.",
         },
     },
     "concept_critic": {
@@ -247,8 +248,8 @@ DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
         "role": "Sequenzieller Schulnoten-Konsens der Jury-Rollen vor User-Freigabe.",
         "responsibilities": [
             "Bewertet das Konzept aus der Perspektive der jeweils zugewiesenen Jury-Rolle",
-            "Vergibt Note 1–6; Mangelhaft (>=5) verhindert Freigabe",
-            "Liefert Verbesserungsauflagen für den Concept Builder",
+            "Vergibt Note 1–6; Note ≥5 verhindert die Vorstellung an den User",
+            "Liefert Verbesserungsauflagen, damit der Concept Builder die Noten optimiert",
         ],
         "inputs": [
             "requirements_contract",
@@ -260,7 +261,7 @@ DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
         "outputs": ["concept_panel_grades", "concept_panel_queue", "panel_reviewer_id"],
         "properties": {
             "guidance": "",
-            "notes": "Fixed Node; Jury-Mitglieder kommen aus enabled Agents (Flex/Interior/V&V/Critic/Fertigung).",
+            "notes": "Jury-Mitglieder = Supervisor-Roster. Vorstellung nur ohne Note ≥5; Builder optimiert Noten, max. 4 Runden, Revert bei schlechterem Schnitt.",
         },
     },
     "custom_agent_1": {
@@ -319,6 +320,7 @@ DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
         "responsibilities": [
             "Mehrteil-Dekomposition (LLM oder Heuristik) unter Beachtung der V&V-Requirements",
             "2D-Sketch / Konzeptfoto für Human-Approval",
+            "Optimiert bei Jury-Feedback die Noten der beteiligten Agenten (Note ≥5 ist Blocker)",
             "gap_analysis und Annahmen dokumentieren",
         ],
         "inputs": ["user_prompt", "vv_requirements", "advisory_notes", "refinement_request"],
@@ -374,7 +376,7 @@ DEFAULT_AGENTS: dict[str, dict[str, Any]] = {
         "outputs": ["manufacturing_plan", "manufacturing_feasibility", "manufacturing_assessed"],
         "properties": {
             "guidance": "",
-            "notes": "Nutzt Tool-Tabelle und maschinenbezogene Assets aus der Inventar-DB.",
+            "notes": "Fertigungspfad nach Inventar immer (wenn enabled). In der Konzept-Jury nur bei Komplexität high.",
         },
     },
     "montage_manager": {

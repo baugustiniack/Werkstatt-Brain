@@ -87,7 +87,7 @@ class AgentState(TypedDict, total=False):
     concept_open_points_cleared: bool
     concept_clarify_rounds: int
 
-    # Konzept-Jury (Konsens mit Schulnoten, Version B = nur aktuelle Runde)
+    # Konzept-Jury (Noten optimieren, Veto bei Note ≥5, max. 4 Runden)
     concept_panel_round: int
     concept_panel_queue: list[str]
     concept_panel_grades: list[dict[str, Any]]
@@ -96,7 +96,14 @@ class AgentState(TypedDict, total=False):
     concept_panel_forced: bool
     concept_panel_done: bool
     concept_panel_awaiting_rebuild: bool
+    concept_panel_history: list[dict[str, Any]]
+    concept_panel_reverted: bool
     panel_reviewer_id: str | None
+    # Supervisor-Roster nach Komplexität (low|medium|high)
+    concept_complexity: str
+    concept_roster: list[str]
+    concept_complexity_reasons: list[str]
+    concept_complexity_score: int
 
     # --- V&V / Flexible / Fertigung ---
     # vv_requirements: phasenweise Requirements (concept → design → manufacturing)

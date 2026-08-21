@@ -58,6 +58,30 @@ export class ApiError extends Error {
   }
 }
 
+function formatApiDetail(detail: unknown): string | undefined {
+  if (detail == null) return undefined;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item && typeof item === "object" && "msg" in item) {
+          const loc = Array.isArray((item as { loc?: unknown }).loc)
+            ? (item as { loc: unknown[] }).loc.join(".")
+            : "";
+          return loc ? `${loc}: ${String((item as { msg: unknown }).msg)}` : String((item as { msg: unknown }).msg);
+        }
+        return null;
+      })
+      .filter(Boolean);
+    if (parts.length) return parts.join("; ");
+  }
+  if (typeof detail === "object" && detail !== null && "detail" in detail) {
+    return formatApiDetail((detail as { detail: unknown }).detail);
+  }
+  return undefined;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${resolveApiBaseUrl()}${path}`, {
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
@@ -72,9 +96,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       detail = await response.text().catch(() => undefined);
     }
     const message =
-      (typeof detail === "object" && detail !== null && "detail" in detail
-        ? String((detail as { detail: unknown }).detail)
-        : undefined) ?? `Request fehlgeschlagen: ${response.status} ${response.statusText}`;
+      formatApiDetail(detail) ?? `Request fehlgeschlagen: ${response.status} ${response.statusText}`;
     throw new ApiError(message, response.status, detail);
   }
 
@@ -97,8 +119,7 @@ export const api = {
       if (init?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
       const detail = await response.json().catch(() => undefined);
       const message =
-        (detail && typeof detail === "object" && "detail" in detail ? String(detail.detail) : undefined) ??
-        `Upload fehlgeschlagen: ${response.status}`;
+        formatApiDetail(detail) ?? `Upload fehlgeschlagen: ${response.status}`;
       throw new ApiError(message, response.status, detail);
     }
     return (await response.json()) as T;

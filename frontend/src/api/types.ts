@@ -140,7 +140,11 @@ export interface EscalationPayload {
   concept_panel_average?: number | null;
   concept_panel_passed?: boolean;
   concept_panel_forced?: boolean;
+  concept_panel_reverted?: boolean;
   concept_panel_round?: number | null;
+  concept_complexity?: string | null;
+  concept_roster?: string[] | null;
+  concept_complexity_reasons?: string[] | null;
   vv_requirements?: {
     title?: string;
     phase?: string;
@@ -160,7 +164,8 @@ export interface EscalationPayload {
 /** Entscheidung des Nutzers auf eine Freigabe-Eskalation. */
 export type ConceptDecision =
   | { decision: "approve" }
-  | { decision: "revise"; feedback: string }
+  | { decision: "revise"; feedback?: string; user_grade?: number }
+  | { decision: "next_round"; feedback?: string; user_grade?: number }
   | { decision: "answer"; answer: string };
 
 // ── backend/app/api/endpoints/cad.py ────────────────────────────────────────
@@ -299,6 +304,7 @@ export interface InventoryItem {
   file_type: AssetFileType;
   source: AssetSource;
   status: AssetStatus;
+  folder_id: string | null;
   tags: string[];
   vision_result: Record<string, unknown> | null;
   /** @deprecated Alias für ai_notes */
@@ -308,6 +314,25 @@ export interface InventoryItem {
   error_message: string | null;
   discovered_at: string;
   processed_at: string | null;
+}
+
+export interface InventoryFolder {
+  id: string;
+  name: string;
+  parent_id: string | null;
+  sort_order: number;
+  item_count: number;
+  created_at: string;
+}
+
+export interface InventoryFolderCreateRequest {
+  name: string;
+  parent_id?: string | null;
+}
+
+export interface InventoryFolderUpdateRequest {
+  name?: string;
+  parent_id?: string | null;
 }
 
 export interface InventoryItemListResponse {
@@ -322,6 +347,7 @@ export interface ManualEntryCreateRequest {
   user_notes?: string;
   tags?: string[];
   auto_process?: boolean;
+  folder_id?: string | null;
 }
 
 export interface InventoryItemUpdateRequest {
@@ -330,6 +356,7 @@ export interface InventoryItemUpdateRequest {
   user_notes?: string;
   ai_notes?: string;
   tags?: string[];
+  folder_id?: string | null;
 }
 
 export interface ProcessPendingResponse {

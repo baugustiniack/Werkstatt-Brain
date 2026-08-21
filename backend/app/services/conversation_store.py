@@ -152,7 +152,12 @@ def persist_session_artifacts(
             )
             .all()
         )
-        hash_known = any((a.meta or {}).get("file_hash") == file_hash for a in prior_concepts)
+        hash_known = any(
+            (a.meta or {}).get("file_hash") == file_hash
+            and (a.meta or {}).get("concept_panel_round") == values.get("concept_panel_round")
+            and not values.get("concept_revision")
+            for a in prior_concepts
+        )
         if not hash_known:
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
             dest = _copy_into_conversation(
@@ -163,6 +168,7 @@ def persist_session_artifacts(
             if dest:
                 contract = values.get("requirements_contract") if isinstance(values.get("requirements_contract"), dict) else None
                 title = (contract or {}).get("project_title") or "Konzept-Foto"
+                panel_round = values.get("concept_panel_round")
                 art = ConversationArtifact(
                     conversation_id=conversation_id,
                     message_id=message_id,
@@ -180,6 +186,11 @@ def persist_session_artifacts(
                         "vv_requirements": values.get("vv_requirements"),
                         "concept_image_url": values.get("concept_image_url"),
                         "concept_image_urls": values.get("concept_image_urls"),
+                        "concept_panel_grades": values.get("concept_panel_grades"),
+                        "concept_panel_average": values.get("concept_panel_average"),
+                        "concept_panel_round": panel_round,
+                        "concept_panel_reverted": values.get("concept_panel_reverted"),
+                        "concept_revision": bool(values.get("concept_revision")),
                         "session_id": cad_session_id,
                     },
                 )

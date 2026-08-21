@@ -203,11 +203,17 @@ def _llm_decompose_request(
         )
     if feedback:
         prev_json = json.dumps({"parts": previous_parts or []}, ensure_ascii=False)
+        jury_rev = "Jury-Noten" in feedback or "BLOCKER" in feedback
+        label = "Jury-Rückmeldung (Noten der beteiligten Agenten optimieren)" if jury_rev else "Nutzer-Rückmeldung zur Überarbeitung"
         user_message += (
             f"\n\nBisheriger Entwurf: {prev_json}\n"
-            f"Nutzer-Rückmeldung zur Überarbeitung: {feedback}\n"
-            "Überarbeite den Entwurf entsprechend dieser Rückmeldung – "
-            "Referenzfotos bleiben Ground Truth."
+            f"{label}: {feedback}\n"
+            "Überarbeite den Entwurf entsprechend – Referenzfotos bleiben Ground Truth. "
+            + (
+                "Priorität: schlechteste Jury-Noten anheben; Note 5/6 ist inakzeptabel."
+                if jury_rev
+                else ""
+            )
         )
     return call_llm_json(
         _decomposition_system_prompt(),
@@ -261,6 +267,14 @@ def _build_concept(
             }
         except Exception as exc:  # noqa: BLE001 - LLM-Ausfall darf den Workflow nie hart stoppen
             logger.warning("LLM-Dekomposition fehlgeschlagen, Fallback auf Heuristik: %s", exc)
+            if feedback and previous_parts:
+                return {
+                    "project_title": "Werkstatt-Projekt",
+                    "parts": copy.deepcopy(previous_parts),
+                    "gap_analysis": [
+                        f"LLM-Überarbeitung fehlgeschlagen ({exc}) – Entwurf unverändert; bitte erneut versuchen."
+                    ],
+                }
 
     return _fallback_decompose(user_prompt)
 
@@ -537,6 +551,7 @@ def concept_builder_node(state: AgentState) -> AgentState:
         "concept_open_points_cleared": False,
         "concept_revision": bool(is_concept_feedback),
         "last_concept_feedback": feedback_text,
+        "coherence_critique": None,
         "current_part_index": 0,
         "completed_parts": [],
         "refinement_request": None,

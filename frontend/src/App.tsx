@@ -6,14 +6,14 @@ import { DashboardLayout, type DashboardTab } from "./components/layout/Dashboar
 import { ConversationPanel } from "./components/conversation/ConversationPanel";
 import { EscalationDialog } from "./components/agentTrace/EscalationDialog";
 import { ModelViewer, type ModelViewerPart, type ReferenceMediaPreview } from "./components/modelViewer/ModelViewer";
+import { ConceptStage } from "./components/modelViewer/ConceptStage";
 import { DownloadCenter } from "./components/modelViewer/DownloadCenter";
 import { MigrateButton } from "./components/modelViewer/MigrateButton";
 import { AssetLibrary } from "./components/inventory/AssetLibrary";
-import { UploadDropzone } from "./components/inventory/UploadDropzone";
-import { CrawlerPanel } from "./components/inventory/CrawlerPanel";
 import { InventoryMobileQr, MobilePhotoUploadPage } from "./components/inventory/MobilePhotoUpload";
 import { LoggingPanel } from "./components/logging/LoggingPanel";
 import { AgentWorkflowPanel } from "./components/workflow/AgentWorkflowPanel";
+import type { AgentNodeName } from "./api/types";
 import type { ConversationArtifact } from "./hooks/useConversations";
 
 function useHashRoute(): string {
@@ -81,16 +81,57 @@ function App() {
     (a) => a.kind === "stl" && (a.part_index ?? 0) === selectedPartIndex,
   );
 
-  useEffect(() => {
-    setSelectedPartIndex(Math.max(parts.length - 1, 0));
-  }, [parts.length]);
+  const hasLiveCadParts = liveParts.length > 0;
 
-  // Konzept-Freigabe + Klärungsfragen laufen inline im Chat; Rest als Dialog
+  const CONCEPT_PHASE_NODES = new Set<AgentNodeName>([
+    "flexible_specialist",
+    "interior_architect",
+    "vv_manager",
+    "concept_builder",
+    "concept_critic",
+    "concept_panel_reviewer",
+    "human_escalation",
+    "supervisor",
+  ]);
+
+  const CONCEPT_ESCALATION_REASONS = new Set([
+    "requirements_question",
+    "requirements_confirm",
+    "requirements_approval",
+    "concept_approval",
+    "concept_clarification",
+  ]);
+
+  const inConceptWorkflow =
+    cad.status === "connecting" ||
+    cad.status === "running" ||
+    cad.status === "escalation" ||
+    (cad.status === "cancelled" && Boolean(cad.pausedSessionId)) ||
+    CONCEPT_PHASE_NODES.has(cad.currentNode as AgentNodeName) ||
+    Boolean(cad.conceptImageUrl) ||
+    cad.conceptImageUrls.length > 0 ||
+    cad.conceptPanelGrades.length > 0 ||
+    cad.conceptPanelRound > 0 ||
+    (cad.status === "escalation" &&
+      CONCEPT_ESCALATION_REASONS.has(cad.escalation?.reason ?? ""));
+
+  /** Konzept-Bühne im Model-Viewer-Panel – auch wenn ältere STL-Artefakte im Chat liegen. */
+  const showConceptStage = !hasLiveCadParts && inConceptWorkflow;
+
+  useEffect(() => {
+    if (cad.status === "connecting" || cad.status === "running") {
+      setReferencePreview(null);
+    }
+  }, [cad.status]);
+
+  // V&V + Konzept-Freigabe laufen inline im Chat; nur unbekannte Eskalationen als Dialog
   const showGenericEscalation =
     cad.escalation &&
     cad.escalation.reason !== "concept_approval" &&
     cad.escalation.reason !== "concept_clarification" &&
-    cad.escalation.reason !== "requirements_question"
+    cad.escalation.reason !== "requirements_question" &&
+    cad.escalation.reason !== "requirements_confirm" &&
+    cad.escalation.reason !== "requirements_approval"
       ? cad.escalation
       : null;
 
@@ -126,45 +167,48 @@ function App() {
             <section className="flex min-h-0 flex-col rounded-lg border border-workshop-border bg-workshop-panel">
               <header className="border-b border-workshop-border px-4 py-2">
                 <h2 className="text-xs font-mono font-semibold tracking-widest text-workshop-muted uppercase">
-                  {referencePreview ? "Model Viewer · Referenz" : "3D Model Viewer"}
+                  {referencePreview && !showConceptStage
+                    ? "Model Viewer · Referenz"
+                    : showConceptStage
+                      ? "3D Model Viewer · Konzept"
+                      : "3D Model Viewer"}
                 </h2>
               </header>
-              <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
+              <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-4">
                 <div className="min-h-0 flex-1">
-                  <ModelViewer
-                    stlUrl={singleStlUrl}
-                    parts={parts}
-                    selectedPartIndex={selectedPartIndex}
-                    onSelectPartIndex={setSelectedPartIndex}
-                    referencePreview={referencePreview}
-                    onClearReferencePreview={() => setReferencePreview(null)}
-                  />
+                  {showConceptStage ? (
+                    <ConceptStage cad={cad} />
+                  ) : (
+                    <ModelViewer
+                      stlUrl={singleStlUrl}
+                      parts={parts}
+                      selectedPartIndex={selectedPartIndex}
+                      onSelectPartIndex={setSelectedPartIndex}
+                      referencePreview={referencePreview}
+                      onClearReferencePreview={() => setReferencePreview(null)}
+                    />
+                  )}
                 </div>
-                <DownloadCenter
-                  sessionId={liveParts.length > 0 ? cad.sessionId : null}
-                  partIndex={hasAnyPart ? selectedPartIndex : undefined}
-                  stepUrl={liveParts.length === 0 && stepArtifact ? `${apiBaseUrl()}${stepArtifact.url}` : null}
-                  stlUrl={liveParts.length === 0 && stlArtifact ? `${apiBaseUrl()}${stlArtifact.url}` : null}
-                />
-                <MigrateButton
-                  sessionId={cad.sessionId}
-                  canMigrate={liveParts.length > 0}
-                  partIndex={liveParts.length > 0 ? selectedPartIndex : undefined}
-                />
+                {!showConceptStage && (
+                  <>
+                    <DownloadCenter
+                      sessionId={liveParts.length > 0 ? cad.sessionId : null}
+                      partIndex={hasAnyPart ? selectedPartIndex : undefined}
+                      stepUrl={liveParts.length === 0 && stepArtifact ? `${apiBaseUrl()}${stepArtifact.url}` : null}
+                      stlUrl={liveParts.length === 0 && stlArtifact ? `${apiBaseUrl()}${stlArtifact.url}` : null}
+                    />
+                    <MigrateButton
+                      sessionId={cad.sessionId}
+                      canMigrate={liveParts.length > 0}
+                      partIndex={liveParts.length > 0 ? selectedPartIndex : undefined}
+                    />
+                  </>
+                )}
               </div>
             </section>
           </div>
         }
-        inventory={
-          <div className="flex flex-col gap-4">
-            <InventoryMobileQr />
-            <AssetLibrary />
-            <div className="grid grid-cols-1 gap-3 border-t border-workshop-border pt-3 md:grid-cols-2">
-              <UploadDropzone />
-              <CrawlerPanel />
-            </div>
-          </div>
-        }
+        inventory={<AssetLibrary listHeader={<InventoryMobileQr />} />}
         logging={<LoggingPanel preferredConversationId={activeConversationId} />}
         workflow={<AgentWorkflowPanel />}
       />

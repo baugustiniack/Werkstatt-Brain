@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Enum, String, Text, func
+from sqlalchemy import DateTime, Enum, ForeignKey, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -43,6 +43,9 @@ class UnprocessedAsset(Base):
     __tablename__ = "unprocessed_assets"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    folder_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("inventory_folders.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     file_path: Mapped[str | None] = mapped_column(String(512), unique=True)
     file_hash: Mapped[str | None] = mapped_column(String(64), index=True)
     file_type: Mapped[AssetFileType] = mapped_column(

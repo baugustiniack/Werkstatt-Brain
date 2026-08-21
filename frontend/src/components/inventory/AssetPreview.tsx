@@ -124,8 +124,37 @@ export function AssetListIcon({
   return <TypeBadge label="FILE" />;
 }
 
+/** Kompakte Listen-Vorschau: echte Bild-Thumbnails, sonst Typ-Badge. */
+export function AssetListThumbnail({
+  itemId,
+  fileType,
+  fileName,
+}: {
+  itemId: string;
+  fileType: AssetFileType | string;
+  fileName?: string | null;
+}) {
+  const kind = resolvePreviewKind(fileType, fileName);
+  if (kind === "image") {
+    return (
+      <img
+        src={assetThumbUrl(itemId)}
+        alt=""
+        loading="lazy"
+        decoding="async"
+        className="h-10 w-10 shrink-0 rounded border border-workshop-border object-cover bg-black/20"
+      />
+    );
+  }
+  return <AssetListIcon fileType={fileType as AssetFileType} fileName={fileName} />;
+}
+
 export function assetFileUrl(itemId: string): string {
   return `${apiBaseUrl()}/api/v1/inventory/items/${itemId}/file?inline=1`;
+}
+
+export function assetThumbUrl(itemId: string): string {
+  return `${apiBaseUrl()}/api/v1/inventory/items/${itemId}/file?inline=1&size=thumb`;
 }
 
 /**
@@ -207,7 +236,7 @@ export function AssetPreview({
   compact?: boolean;
 }) {
   if (compact) {
-    return <AssetListIcon fileType={fileType} fileName={fileName} />;
+    return <AssetListThumbnail itemId={itemId} fileType={fileType} fileName={fileName} />;
   }
   return <MediaFilePreview itemId={itemId} fileType={fileType} fileName={fileName} />;
 }

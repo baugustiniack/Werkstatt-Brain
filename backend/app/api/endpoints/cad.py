@@ -198,6 +198,16 @@ class CadResumeRunResponse(BaseModel):
     total_parts: int = 0
     concept_image_url: str | None = None
     requirements_contract: dict[str, Any] | None = None
+    concept_image_urls: list[dict[str, Any]] | None = None
+    concept_panel_grades: list[dict[str, Any]] | None = None
+    concept_panel_average: float | None = None
+    concept_panel_round: int | None = None
+    concept_panel_queue: list[str] | None = None
+    panel_reviewer_id: str | None = None
+    concept_roster: list[str] | None = None
+    concept_panel_awaiting_rebuild: bool | None = None
+    concept_panel_reverted: bool | None = None
+    agent_transcript: list[dict[str, Any]] | None = None
 
 
 class CadWorkflowResponse(BaseModel):
@@ -232,7 +242,29 @@ def _assistant_summary(values: dict[str, Any], status: str) -> str:
     if status == "human_approval_required":
         revised = bool(values.get("concept_revision"))
         prefix = "Überarbeitetes Konzept" if revised else "Konzept"
-        lines.append(f"{prefix} „{title}“ liegt zur Freigabe bereit ({len(parts)} Teil(e)).")
+        round_no = values.get("concept_panel_round")
+        round_hint = f" (Jury-Runde {round_no})" if round_no else ""
+        lines.append(f"{prefix} „{title}“ liegt zur Freigabe bereit{round_hint} ({len(parts)} Teil(e)).")
+        grades = values.get("concept_panel_grades") or []
+        if grades:
+            avg = values.get("concept_panel_average")
+            grade_bits = []
+            for g in grades:
+                if not isinstance(g, dict):
+                    continue
+                aid = g.get("agent_id") or "Agent"
+                grade_bits.append(f"{aid}: {g.get('grade')}/6")
+            lines.append(
+                "Jury: "
+                + ", ".join(grade_bits)
+                + (f" · Schnitt {avg}" if avg is not None else "")
+            )
+            for g in grades:
+                if not isinstance(g, dict):
+                    continue
+                verdict = str(g.get("verdict") or "").strip()
+                if verdict:
+                    lines.append(f"- {g.get('agent_id')}: {verdict}")
         if parts:
             names = ", ".join((p.get("name") or f"Teil {i+1}") for i, p in enumerate(parts[:12]))
             lines.append(f"Teile: {names}")
@@ -331,12 +363,14 @@ def _format_escalation_user_message(decision: Any, escalation: dict[str, Any] | 
         decision.get("feedback") or decision.get("note") or decision.get("answer") or ""
     ).strip()
 
-    if decision.get("decision") == "revise" or decision.get("approved") is False:
+    if decision.get("decision") == "revise" or decision.get("decision") == "next_round" or decision.get("approved") is False:
         if reason == "concept_approval":
+            grade = decision.get("user_grade")
+            grade_line = f"\nMeine Bewertung: {grade}/6." if grade is not None else ""
             return (
-                f"Änderungswunsch am Konzept:\n{feedback}"
+                f"Nächste Konzept-Runde anfordern{grade_line}\n{feedback}"
                 if feedback
-                else "Änderungswunsch am Konzept (ohne weitere Details)."
+                else f"Nächste Konzept-Runde anfordern.{grade_line}".strip()
             )
         if reason == "requirements_approval":
             return (
@@ -349,7 +383,15 @@ def _format_escalation_user_message(decision: Any, escalation: dict[str, Any] | 
     if decision.get("decision") == "approve" or decision.get("approved") is True:
         if reason == "concept_approval":
             return "Konzept freigegeben – bitte ausarbeiten."
-        if reason == "requirements_approval":
+        if reason in {"requirements_confirm", "requirements_approval"}:
+            reqs = (escalation or {}).get("vv_requirements") or {}
+            req_list = reqs.get("requirements") if isinstance(reqs, dict) else None
+            if isinstance(req_list, list) and req_list:
+                bullets = "\n".join(f"- {str(r).strip()}" for r in req_list[:30] if str(r).strip())
+                return f"Anforderungsliste freigegeben:\n{bullets}"
+            summary = str((escalation or {}).get("summary") or "").strip()
+            if summary:
+                return f"Anforderungsliste freigegeben:\n{summary[:3000]}"
             return "Anforderungsliste freigegeben."
         return "Freigabe erteilt."
 
@@ -721,6 +763,40 @@ def _run_stream_in_thread(
         asyncio.run_coroutine_threadsafe(queue.put(("done", None)), loop)
 
 
+_CONCEPT_STREAM_KEYS = (
+    "concept_image_url",
+    "concept_image_urls",
+    "concept_sketch_svg",
+    "concept_panel_grades",
+    "concept_panel_average",
+    "concept_panel_round",
+    "concept_panel_queue",
+    "panel_reviewer_id",
+    "concept_roster",
+    "concept_panel_awaiting_rebuild",
+    "concept_panel_reverted",
+    "requirements_contract",
+    "agent_transcript",
+    "completed_parts",
+    "current_part_index",
+)
+
+
+def _enrich_stream_state(stream_state: dict[str, Any], node_value: dict[str, Any]) -> dict[str, Any]:
+    """Fügt Konzept-/Panel-Felder aus dem laufenden Stream-State hinzu (Updates sind oft Deltas)."""
+    if "agent_transcript" in node_value and isinstance(node_value["agent_transcript"], list):
+        prev = list(stream_state.get("agent_transcript") or [])
+        merged = prev + node_value["agent_transcript"]
+        stream_state["agent_transcript"] = merged[-80:]
+    stream_state.update({k: v for k, v in node_value.items() if k != "agent_transcript"})
+    enriched = dict(node_value)
+    for key in _CONCEPT_STREAM_KEYS:
+        val = stream_state.get(key)
+        if val is not None and val != "" and val != []:
+            enriched[key] = val
+    return enriched
+
+
 async def _stream_once(
     websocket: WebSocket,
     graph_input: Any,
@@ -740,8 +816,10 @@ async def _stream_once(
 
     escalation_payload: dict[str, Any] | None = None
     last_completed_count = 0
+    stream_state: dict[str, Any] = {}
     try:
-        last_completed_count = len((_snapshot_run_state(session_id).get("completed_parts") or []))
+        stream_state = dict(_snapshot_run_state(session_id))
+        last_completed_count = len((stream_state.get("completed_parts") or []))
     except Exception:  # noqa: BLE001
         pass
 
@@ -774,6 +852,12 @@ async def _stream_once(
                                 "concept_image_urls",
                                 "concept_sketch_svg",
                                 "vv_requirements",
+                                "concept_panel_grades",
+                                "concept_panel_average",
+                                "concept_panel_round",
+                                "concept_panel_reverted",
+                                "concept_roster",
+                                "concept_complexity",
                             ):
                                 if escalation_payload.get(key) is not None:
                                     snap[key] = escalation_payload[key]
@@ -781,6 +865,8 @@ async def _stream_once(
                     except Exception:  # noqa: BLE001
                         pass
                     continue
+                if isinstance(node_value, dict):
+                    node_value = _enrich_stream_state(stream_state, node_value)
                 await websocket.send_json({"type": "node_update", "node": node_name, "state": node_value})
                 # Fertige Teile sofort in die Conversation kopieren (überlebt Standby/Cancel)
                 if isinstance(node_value, dict) and "completed_parts" in node_value:
@@ -1130,6 +1216,20 @@ async def resume_cad_run(request: CadResumeRunRequest) -> CadResumeRunResponse:
         total_parts=len(contract.get("parts") or []),
         concept_image_url=hydrated.get("concept_image_url"),
         requirements_contract=contract or None,
+        concept_image_urls=hydrated.get("concept_image_urls") or None,
+        concept_panel_grades=hydrated.get("concept_panel_grades") or None,
+        concept_panel_average=hydrated.get("concept_panel_average"),
+        concept_panel_round=int(hydrated.get("concept_panel_round") or 0) or None,
+        concept_panel_queue=hydrated.get("concept_panel_queue") or None,
+        panel_reviewer_id=hydrated.get("panel_reviewer_id"),
+        concept_roster=hydrated.get("concept_roster") or None,
+        concept_panel_awaiting_rebuild=bool(hydrated.get("concept_panel_awaiting_rebuild"))
+        if hydrated.get("concept_panel_awaiting_rebuild") is not None
+        else None,
+        concept_panel_reverted=bool(hydrated.get("concept_panel_reverted"))
+        if hydrated.get("concept_panel_reverted") is not None
+        else None,
+        agent_transcript=hydrated.get("agent_transcript") or None,
     )
 
 

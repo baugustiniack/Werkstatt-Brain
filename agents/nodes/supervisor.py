@@ -2,12 +2,16 @@
 
 import logging
 
+from agents.concept_complexity import (
+    agent_in_roster,
+    assess_concept_complexity,
+    merge_complexity,
+)
 from agents.concept_panel import (
     MAX_PANEL_ROUNDS,
-    build_revision_feedback,
+    decide_completed_round,
     jury_agents,
     next_reviewer_updates,
-    panel_status_message,
     start_panel_round,
     summarize_round,
 )
@@ -94,19 +98,58 @@ def _advance_to_next_part(state: AgentState) -> AgentState | None:
     }
 
 
+def _ensure_complexity(state: AgentState) -> AgentState | None:
+    """Supervisor stuft Komplexität ein und legt das Agenten-Roster fest."""
+    fresh = assess_concept_complexity(state)
+    merged = merge_complexity(
+        {
+            "concept_complexity": state.get("concept_complexity"),
+            "concept_roster": state.get("concept_roster"),
+            "concept_complexity_reasons": state.get("concept_complexity_reasons"),
+            "concept_complexity_score": state.get("concept_complexity_score"),
+        },
+        fresh,
+    )
+    if (
+        merged.get("concept_complexity") == state.get("concept_complexity")
+        and list(merged.get("concept_roster") or []) == list(state.get("concept_roster") or [])
+    ):
+        return None
+    reasons = merged.get("concept_complexity_reasons") or []
+    roster = merged.get("concept_roster") or []
+    note = (
+        f"Komplexität {merged.get('concept_complexity')} → Roster: {', '.join(roster) or '(leer)'}"
+        + (f" ({'; '.join(reasons[:4])})" if reasons else "")
+    )
+    logger.info("Supervisor: %s", note)
+    return {
+        **merged,
+        "messages": [{"role": "assistant", "content": f"[Supervisor] {note}"}],
+        "agent_transcript": [
+            make_entry(
+                "supervisor",
+                "complexity_roster",
+                note,
+                detail=merged,
+                to_agent="supervisor",
+            )
+        ],
+    }
+
+
 def _overlay_for_disabled_agents(state: AgentState) -> AgentState:
     """Virtueller State, damit deaktivierte optionale Agenten übersprungen werden."""
     overlay: AgentState = dict(state)
     # Flexible aus
-    if not is_agent_enabled("flexible_specialist"):
+    if not is_agent_enabled("flexible_specialist") or not agent_in_roster(overlay, "flexible_specialist"):
         overlay["flexible_consulted"] = True
-    if not is_agent_enabled("interior_architect"):
+    if not is_agent_enabled("interior_architect") or not agent_in_roster(overlay, "interior_architect"):
         overlay["interior_consulted"] = True
     if not is_agent_enabled("concept_critic"):
         overlay["concept_critiqued"] = True
         overlay["concept_open_points_cleared"] = True
     # Jury komplett deaktiviert → Panel als erledigt markieren (Freigabe setzt _panel_phase_updates)
-    if not jury_agents():
+    if not jury_agents(overlay):
         overlay["concept_critiqued"] = True
         overlay["concept_open_points_cleared"] = True
         if overlay.get("requirements_contract") and not overlay.get("concept_approved"):
@@ -114,10 +157,11 @@ def _overlay_for_disabled_agents(state: AgentState) -> AgentState:
             overlay["concept_panel_passed"] = True
             overlay["human_approval_required"] = True
             overlay["escalation_reason"] = "concept_approval"
-    # Leer-Agenten aus → als konsultiert markieren
+    # Leer-Agenten: nur bei hoher Komplexität, sonst überspringen
     consulted_empty = list(overlay.get("empty_agents_consulted") or [])
+    skip_empty = str(overlay.get("concept_complexity") or "") in {"low", "medium"}
     for aid in ("custom_agent_1", "custom_agent_2"):
-        if not is_agent_enabled(aid) and aid not in consulted_empty:
+        if (not is_agent_enabled(aid) or skip_empty) and aid not in consulted_empty:
             consulted_empty.append(aid)
     overlay["empty_agents_consulted"] = consulted_empty
     # Inventory aus → leerer Kontext, damit Pipeline weiterläuft
@@ -206,7 +250,7 @@ def _panel_phase_updates(state: AgentState) -> AgentState | None:
     ) == "concept_builder":
         return None
 
-    jury = jury_agents()
+    jury = jury_agents(state)
     if not jury:
         return {
             "concept_panel_done": True,
@@ -240,11 +284,9 @@ def _panel_phase_updates(state: AgentState) -> AgentState | None:
     if awaiting and not state.get("refinement_request"):
         started = start_panel_round(state)
         started["concept_panel_awaiting_rebuild"] = False
-        started["concept_critiqued"] = True
-        started["concept_open_points_cleared"] = True
         msg = (
             f"Jury-Runde {started['concept_panel_round']}/{MAX_PANEL_ROUNDS} gestartet "
-            f"({len(jury)} Prüfer)."
+            f"({len(jury)} Prüfer, Komplexität={state.get('concept_complexity') or '?'})."
         )
         started["messages"] = [{"role": "assistant", "content": f"[Supervisor] {msg}"}]
         started["agent_transcript"] = [
@@ -261,11 +303,9 @@ def _panel_phase_updates(state: AgentState) -> AgentState | None:
 
     if round_no == 0 and not queue and not awaiting:
         started = start_panel_round(state)
-        started["concept_critiqued"] = True
-        started["concept_open_points_cleared"] = True
         msg = (
             f"Jury-Runde {started['concept_panel_round']}/{MAX_PANEL_ROUNDS} gestartet "
-            f"({len(jury)} Prüfer)."
+            f"({len(jury)} Prüfer, Komplexität={state.get('concept_complexity') or '?'})."
         )
         started["messages"] = [{"role": "assistant", "content": f"[Supervisor] {msg}"}]
         started["agent_transcript"] = [
@@ -293,84 +333,34 @@ def _panel_phase_updates(state: AgentState) -> AgentState | None:
 
     if grades and round_no > 0 and not awaiting:
         summary = summarize_round(grades)
-        avg = summary.get("average")
-        if summary.get("passed"):
-            msg = panel_status_message(summary, round_no=round_no)
-            logger.info(msg)
-            return {
-                "concept_panel_average": avg,
-                "concept_panel_passed": True,
-                "concept_panel_forced": False,
-                "concept_panel_done": True,
-                "concept_panel_awaiting_rebuild": False,
-                "human_approval_required": True,
-                "escalation_reason": "concept_approval",
-                "messages": [{"role": "assistant", "content": f"[Supervisor] {msg}"}],
-                "agent_transcript": [
-                    make_entry(
-                        "supervisor",
-                        "panel_passed",
-                        msg,
-                        detail={"round": round_no, "summary": summary, "grades": grades},
-                        to_agent="human_escalation",
-                    )
-                ],
-            }
-
-        if round_no >= MAX_PANEL_ROUNDS:
-            msg = panel_status_message(summary, round_no=round_no, forced=True)
-            logger.warning(msg)
-            return {
-                "concept_panel_average": avg,
-                "concept_panel_passed": False,
-                "concept_panel_forced": True,
-                "concept_panel_done": True,
-                "concept_panel_awaiting_rebuild": False,
-                "human_approval_required": True,
-                "escalation_reason": "concept_approval",
-                "messages": [{"role": "assistant", "content": f"[Supervisor] {msg}"}],
-                "agent_transcript": [
-                    make_entry(
-                        "supervisor",
-                        "panel_forced",
-                        msg,
-                        detail={"round": round_no, "summary": summary, "grades": grades},
-                        to_agent="human_escalation",
-                    )
-                ],
-            }
-
-        feedback = build_revision_feedback(grades, average=avg)
-        msg = panel_status_message(summary, round_no=round_no)
+        decision = decide_completed_round(
+            state, summary=summary, grades=grades, round_no=round_no
+        )
+        msg = str(decision.get("message") or "")
+        action = str(decision.get("action") or "revise")
         logger.info(msg)
-        return {
-            "concept_panel_average": avg,
-            "concept_panel_passed": False,
-            "concept_panel_forced": False,
-            "concept_panel_done": False,
-            "concept_panel_awaiting_rebuild": True,
-            "concept_panel_queue": [],
-            "panel_reviewer_id": None,
-            "refinement_request": {
-                "from_agent": "supervisor",
-                "target": "concept_builder",
-                "reason": "concept_feedback",
-                "feedback": feedback,
-            },
-            "concept_critiqued": False,
-            "human_approval_required": False,
-            "escalation_reason": None,
-            "messages": [{"role": "assistant", "content": f"[Supervisor] {msg}"}],
-            "agent_transcript": [
-                make_entry(
-                    "supervisor",
-                    "panel_failed_revise",
-                    msg,
-                    detail={"round": round_no, "summary": summary, "grades": grades},
-                    to_agent="concept_builder",
-                )
-            ],
-        }
+        to_agent = "human_escalation" if action == "present" else "concept_builder"
+        event = "panel_present" if action == "present" else "panel_optimize"
+        if decision.get("updates", {}).get("concept_panel_reverted"):
+            event = "panel_revert_present" if action == "present" else "panel_revert_revise"
+        updates = dict(decision.get("updates") or {})
+        updates["messages"] = [{"role": "assistant", "content": f"[Supervisor] {msg}"}]
+        updates["agent_transcript"] = [
+            make_entry(
+                "supervisor",
+                event,
+                msg,
+                detail={
+                    "round": round_no,
+                    "summary": summary,
+                    "grades": grades,
+                    "action": action,
+                    "reverted": bool(updates.get("concept_panel_reverted")),
+                },
+                to_agent=to_agent,
+            )
+        ]
+        return updates
 
     return None
 
@@ -478,6 +468,12 @@ def _compute_next_route(state: AgentState) -> str:
             "target"
         ) == "concept_builder":
             return "concept_builder" if is_agent_enabled("concept_builder") else "END"
+        if (
+            effective.get("requirements_contract")
+            and not effective.get("concept_critiqued")
+            and is_agent_enabled("concept_critic")
+        ):
+            return "concept_critic"
         queue = list(effective.get("concept_panel_queue") or [])
         if queue:
             return "concept_panel_reviewer"
@@ -567,8 +563,11 @@ def supervisor_node(state: AgentState) -> AgentState:
     if advance_update is not None:
         return advance_update
 
-    panel_update = _panel_phase_updates(state)
-    working: AgentState = {**state, **(panel_update or {})}
+    complexity_update = _ensure_complexity(state)
+    working0: AgentState = {**state, **complexity_update} if complexity_update else dict(state)
+
+    panel_update = _panel_phase_updates(working0)
+    working: AgentState = {**working0, **(panel_update or {})}
 
     iteration_count = int(working.get("iteration_count", 0) or 0) + 1
     parts = (working.get("requirements_contract") or {}).get("parts", [])
@@ -580,16 +579,31 @@ def supervisor_node(state: AgentState) -> AgentState:
         f"Iteration {iteration_count}"
         + (f", Teil {idx + 1}/{len(parts)}" if parts else "")
         + (f" („{part_name}“)" if part_name else "")
+        + (
+            f", Komplexität={working.get('concept_complexity')}"
+            if working.get("concept_complexity")
+            else ""
+        )
         + f" → Route: {next_route}"
     )
 
+    combined_pre = {}
+    if complexity_update:
+        combined_pre.update({k: v for k, v in complexity_update.items() if k not in {"messages", "agent_transcript"}})
+    if panel_update:
+        combined_pre.update({k: v for k, v in panel_update.items() if k not in {"messages", "agent_transcript"}})
+    pre_msgs = list((complexity_update or {}).get("messages") or []) + list((panel_update or {}).get("messages") or [])
+    pre_tx = list((complexity_update or {}).get("agent_transcript") or []) + list(
+        (panel_update or {}).get("agent_transcript") or []
+    )
+
     updates: AgentState = {
-        **{k: v for k, v in (panel_update or {}).items() if k not in {"messages", "agent_transcript"}},
+        **combined_pre,
         "iteration_count": iteration_count,
         "current_agent": "supervisor",
-        "messages": list((panel_update or {}).get("messages") or [])
+        "messages": pre_msgs
         + [{"role": "assistant", "content": f"[Supervisor] {summary}"}],
-        "agent_transcript": list((panel_update or {}).get("agent_transcript") or [])
+        "agent_transcript": pre_tx
         + [
             make_entry(
                 "supervisor",
@@ -600,6 +614,8 @@ def supervisor_node(state: AgentState) -> AgentState:
                     "current_part_index": idx,
                     "total_parts": len(parts),
                     "part_name": part_name,
+                    "concept_complexity": working.get("concept_complexity"),
+                    "concept_roster": working.get("concept_roster") or [],
                     "concept_approved": bool(state.get("concept_approved")),
                     "vv_phase": state.get("vv_phase"),
                     "flexible_consulted": bool(state.get("flexible_consulted")),

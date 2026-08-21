@@ -31,14 +31,17 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import func
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
+from starlette.responses import Response
 
 from app.config import settings
 from app.db.postgres import SessionLocal
 from app.db.qdrant import CAD_SNIPPETS_COLLECTION, get_qdrant_client, random_placeholder_vector
+from app.models.inventory_folder import InventoryFolder
 from app.models.project_cad import ProjectCad
 from app.models.stock_material import StockMaterial
 from app.models.tool import Tool, ToolStatus
@@ -119,6 +122,7 @@ def _persist_upload_from_path(
     *,
     user_notes: str | None = None,
     mobile: bool = False,
+    folder_id: uuid.UUID | None = None,
 ) -> AssetUploadResponse:
     """Speichert Datei (ggf. Bild-Rekompression) + DB-Eintrag ohne Vision."""
     from app.services.inventory_notes import set_user_notes
@@ -169,6 +173,7 @@ def _persist_upload_from_path(
             title=title or filename,
             status=AssetStatus.PENDING,
             tags=tags,
+            folder_id=folder_id,
         )
         if user_notes:
             set_user_notes(asset, user_notes)
@@ -202,6 +207,7 @@ def _persist_upload(
     *,
     user_notes: str | None = None,
     mobile: bool = False,
+    folder_id: uuid.UUID | None = None,
 ) -> AssetUploadResponse:
     """Kompatibilitäts-Wrapper: bytes → Tempdatei → Persistenz."""
     upload_dir = Path(settings.uploads_dir)
@@ -212,7 +218,7 @@ def _persist_upload(
     try:
         tmp_path.write_bytes(content)
         return _persist_upload_from_path(
-            filename, tmp_path, title, user_notes=user_notes, mobile=mobile
+            filename, tmp_path, title, user_notes=user_notes, mobile=mobile, folder_id=folder_id
         )
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -231,9 +237,16 @@ def _ingest_asset_by_id(asset_id: str) -> None:
         db.close()
 
 
-def _persist_upload_and_ingest(filename: str, content: bytes, title: str | None) -> AssetUploadResponse:
+def _persist_upload_and_ingest(
+    filename: str,
+    content: bytes,
+    title: str | None,
+    *,
+    user_notes: str | None = None,
+    folder_id: uuid.UUID | None = None,
+) -> AssetUploadResponse:
     """Legacy-Pfad: speichern + sofort Vision (Desktop-Dropzone)."""
-    saved = _persist_upload(filename, content, title)
+    saved = _persist_upload(filename, content, title, user_notes=user_notes, folder_id=folder_id)
     if saved.duplicate:
         return saved
     db = SessionLocal()
@@ -261,6 +274,7 @@ async def upload_asset(
     file: UploadFile = File(...),
     title: str | None = Form(None),
     user_notes: str | None = Form(None),
+    folder_id: str | None = Form(None),
     auto_process: bool = Form(True),
     defer_process: bool = Form(False),
 ) -> AssetUploadResponse:
@@ -305,6 +319,13 @@ async def upload_asset(
             ext = "jpg" if subtype in ("jpeg", "jpg") else subtype.split("+")[0]
             filename = f"{filename}.{ext}"
 
+        parsed_folder: uuid.UUID | None = None
+        if folder_id:
+            try:
+                parsed_folder = uuid.UUID(folder_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Ungültige folder_id.") from exc
+
         # Große Dateien / Chat-Defer: nie synchron visionen (Host-Schutz)
         use_defer = defer_process or total > sync_vision_max or not auto_process
 
@@ -317,6 +338,7 @@ async def upload_asset(
                     title,
                     user_notes=user_notes,
                     mobile=True,
+                    folder_id=parsed_folder,
                 )
             )
             if not saved.duplicate and auto_process:
@@ -324,7 +346,16 @@ async def upload_asset(
             return saved
 
         content = tmp_path.read_bytes()
-        result = await run_in_threadpool(_persist_upload_and_ingest, filename, content, title)
+        result = await run_in_threadpool(
+            partial(
+                _persist_upload_and_ingest,
+                filename,
+                content,
+                title,
+                user_notes=user_notes,
+                folder_id=parsed_folder,
+            )
+        )
         return result
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -591,6 +622,127 @@ def get_crawler_queue(limit: int = 100) -> CrawlerQueueResponse:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GET/POST/PATCH/DELETE /api/v1/inventory/folders
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class InventoryFolderResponse(BaseModel):
+    id: str
+    name: str
+    parent_id: str | None
+    sort_order: int
+    item_count: int = 0
+    created_at: str
+
+
+class InventoryFolderCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    parent_id: str | None = None
+
+
+class InventoryFolderUpdateRequest(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=255)
+    parent_id: str | None = None
+
+
+def _folder_to_response(folder: InventoryFolder, item_count: int = 0) -> InventoryFolderResponse:
+    return InventoryFolderResponse(
+        id=str(folder.id),
+        name=folder.name,
+        parent_id=str(folder.parent_id) if folder.parent_id else None,
+        sort_order=int(folder.sort_order or 0),
+        item_count=item_count,
+        created_at=folder.created_at.isoformat(),
+    )
+
+
+@router.get("/inventory/folders", response_model=list[InventoryFolderResponse])
+def list_inventory_folders() -> list[InventoryFolderResponse]:
+    db = SessionLocal()
+    try:
+        folders = db.query(InventoryFolder).order_by(InventoryFolder.sort_order, InventoryFolder.name).all()
+        counts: dict[uuid.UUID, int] = {}
+        for fid, cnt in db.query(UnprocessedAsset.folder_id, func.count()).group_by(UnprocessedAsset.folder_id).all():
+            if fid is not None:
+                counts[fid] = int(cnt)
+        return [_folder_to_response(f, counts.get(f.id, 0)) for f in folders]
+    finally:
+        db.close()
+
+
+@router.post("/inventory/folders", response_model=InventoryFolderResponse)
+def create_inventory_folder(request: InventoryFolderCreateRequest) -> InventoryFolderResponse:
+    db = SessionLocal()
+    try:
+        parent_uuid: uuid.UUID | None = None
+        if request.parent_id:
+            try:
+                parent_uuid = uuid.UUID(request.parent_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Ungültige parent_id.") from exc
+            if db.get(InventoryFolder, parent_uuid) is None:
+                raise HTTPException(status_code=404, detail="Übergeordneter Ordner nicht gefunden.")
+        folder = InventoryFolder(name=request.name.strip(), parent_id=parent_uuid)
+        db.add(folder)
+        db.commit()
+        db.refresh(folder)
+        return _folder_to_response(folder, 0)
+    finally:
+        db.close()
+
+
+@router.patch("/inventory/folders/{folder_id}", response_model=InventoryFolderResponse)
+def update_inventory_folder(folder_id: str, request: InventoryFolderUpdateRequest) -> InventoryFolderResponse:
+    db = SessionLocal()
+    try:
+        folder = db.get(InventoryFolder, uuid.UUID(folder_id))
+        if folder is None:
+            raise HTTPException(status_code=404, detail="Ordner nicht gefunden.")
+        if request.name is not None:
+            folder.name = request.name.strip()
+        if request.parent_id is not None:
+            if request.parent_id == "":
+                folder.parent_id = None
+            else:
+                try:
+                    parent_uuid = uuid.UUID(request.parent_id)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail="Ungültige parent_id.") from exc
+                if parent_uuid == folder.id:
+                    raise HTTPException(status_code=400, detail="Ordner kann nicht sein eigener Parent sein.")
+                if db.get(InventoryFolder, parent_uuid) is None:
+                    raise HTTPException(status_code=404, detail="Übergeordneter Ordner nicht gefunden.")
+                folder.parent_id = parent_uuid
+        db.commit()
+        db.refresh(folder)
+        cnt = db.query(UnprocessedAsset).filter(UnprocessedAsset.folder_id == folder.id).count()
+        return _folder_to_response(folder, cnt)
+    finally:
+        db.close()
+
+
+@router.delete("/inventory/folders/{folder_id}")
+def delete_inventory_folder(folder_id: str) -> dict[str, str]:
+    db = SessionLocal()
+    try:
+        fid = uuid.UUID(folder_id)
+        folder = db.get(InventoryFolder, fid)
+        if folder is None:
+            raise HTTPException(status_code=404, detail="Ordner nicht gefunden.")
+        db.query(UnprocessedAsset).filter(UnprocessedAsset.folder_id == fid).update(
+            {UnprocessedAsset.folder_id: None}, synchronize_session=False
+        )
+        db.query(InventoryFolder).filter(InventoryFolder.parent_id == fid).update(
+            {InventoryFolder.parent_id: None}, synchronize_session=False
+        )
+        db.delete(folder)
+        db.commit()
+        return {"status": "deleted", "id": folder_id}
+    finally:
+        db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GET/POST/PATCH /api/v1/inventory/items – unstrukturierte Asset-Bibliothek
 # (Nutzer-Feedback: einfache, durchsuchbare Ablage für Dateien UND manuelle
 # Einträge; KI-Strukturierung erfolgt nachträglich, auf Wunsch oder im
@@ -606,6 +758,7 @@ class InventoryItemResponse(BaseModel):
     file_type: str
     source: str
     status: str
+    folder_id: str | None = None
     tags: list[str]
     vision_result: dict[str, Any] | None
     notes: str | None  # Legacy-Alias: spiegelt ai_notes
@@ -626,6 +779,7 @@ def _asset_to_item_response(asset: UnprocessedAsset) -> InventoryItemResponse:
         file_type=asset.file_type.value,
         source=asset.source.value,
         status=asset.status.value,
+        folder_id=str(asset.folder_id) if asset.folder_id else None,
         tags=asset.tags or [],
         vision_result=asset.vision_result,
         notes=ai,
@@ -649,6 +803,7 @@ def list_inventory_items(
     status: str | None = None,
     file_type: str | None = None,
     source: str | None = None,
+    folder_id: str | None = None,
     limit: int = 200,
 ) -> InventoryItemListResponse:
     """Durchsuchbare/filterbare Liste aller Inventar-Einträge (Dateien +
@@ -684,6 +839,14 @@ def list_inventory_items(
                 query = query.filter(UnprocessedAsset.source == AssetSource(source))
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=f"Ungültiger source-Filter '{source}'.") from exc
+        if folder_id is not None:
+            if folder_id in ("", "null", "none"):
+                query = query.filter(UnprocessedAsset.folder_id.is_(None))
+            else:
+                try:
+                    query = query.filter(UnprocessedAsset.folder_id == uuid.UUID(folder_id))
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail="Ungültige folder_id.") from exc
 
         items = query.order_by(UnprocessedAsset.discovered_at.desc()).limit(limit).all()
         # Kein Repair mehr bei jedem List-Poll (Frontend alle ~20s) – das lastete
@@ -702,6 +865,7 @@ class ManualEntryCreateRequest(BaseModel):
     notes: str | None = None  # Legacy: wird als user_notes behandelt
     user_notes: str | None = None
     tags: list[str] = Field(default_factory=list)
+    folder_id: str | None = None
     auto_process: bool = Field(True, description="Sofort per KI/Heuristik strukturieren, statt nur anzulegen.")
 
 
@@ -714,12 +878,19 @@ def create_manual_entry(request: ManualEntryCreateRequest) -> InventoryItemRespo
     db = SessionLocal()
     try:
         user_text = request.user_notes if request.user_notes is not None else request.notes
+        folder_uuid: uuid.UUID | None = None
+        if request.folder_id:
+            try:
+                folder_uuid = uuid.UUID(request.folder_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Ungültige folder_id.") from exc
         asset = UnprocessedAsset(
             title=request.title,
             tags=request.tags,
             file_type=AssetFileType.MANUAL,
             source=AssetSource.MANUAL,
             status=AssetStatus.PENDING,
+            folder_id=folder_uuid,
         )
         set_user_notes(asset, user_text)
         db.add(asset)
@@ -741,6 +912,7 @@ class InventoryItemUpdateRequest(BaseModel):
     user_notes: str | None = None
     ai_notes: str | None = None
     tags: list[str] | None = None
+    folder_id: str | None = None
 
 
 @router.patch("/inventory/items/{item_id}", response_model=InventoryItemResponse)
@@ -765,6 +937,17 @@ def update_inventory_item(item_id: str, request: InventoryItemUpdateRequest) -> 
             set_ai_notes(asset, request.ai_notes)
         if request.tags is not None:
             asset.tags = request.tags
+        if request.folder_id is not None:
+            if request.folder_id in ("", "null", "none"):
+                asset.folder_id = None
+            else:
+                try:
+                    fid = uuid.UUID(request.folder_id)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail="Ungültige folder_id.") from exc
+                if db.get(InventoryFolder, fid) is None:
+                    raise HTTPException(status_code=404, detail="Ordner nicht gefunden.")
+                asset.folder_id = fid
 
         db.commit()
         db.refresh(asset)
@@ -875,8 +1058,24 @@ def process_pending_items(limit: int = 50, include_stubs: bool = True) -> Proces
         db.close()
 
 
-@router.get("/inventory/items/{item_id}/file")
-def get_inventory_item_file(item_id: str, inline: bool = True) -> FileResponse:
+_THUMB_MAX = 96
+
+
+def _image_thumb_response(file_path: Path) -> Response:
+    from PIL import Image
+
+    with Image.open(file_path) as img:
+        img = img.convert("RGB")
+        img.thumbnail((_THUMB_MAX, _THUMB_MAX), Image.Resampling.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=72, optimize=True)
+        buf.seek(0)
+
+    return Response(content=buf.getvalue(), media_type="image/jpeg")
+
+
+@router.get("/inventory/items/{item_id}/file", response_model=None)
+def get_inventory_item_file(item_id: str, inline: bool = True, size: str | None = None):
     """Liefert die Rohdatei eines Eintrags (Thumbnails / PDF-/STL-Voransicht).
 
     `inline=true` (Default) setzt Content-Disposition auf inline, damit Browser
@@ -891,6 +1090,12 @@ def get_inventory_item_file(item_id: str, inline: bool = True) -> FileResponse:
         file_path = Path(asset.file_path)
         if not file_path.is_file():
             raise HTTPException(status_code=404, detail="Datei existiert nicht (mehr) auf dem Server.")
+
+        if size == "thumb" and asset.file_type == AssetFileType.IMAGE:
+            try:
+                return _image_thumb_response(file_path)
+            except Exception:  # noqa: BLE001
+                pass
 
         suffix = file_path.suffix.lower()
         media_type = mimetypes.guess_type(file_path.name)[0]

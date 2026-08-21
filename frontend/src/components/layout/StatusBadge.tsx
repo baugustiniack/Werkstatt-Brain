@@ -10,6 +10,7 @@ const NODE_LABELS: Record<AgentNodeName, string> = {
   vv_manager: "VV_MANAGER",
   concept_builder: "CONCEPT",
   concept_critic: "CONCEPT_CRITIC",
+  concept_panel_reviewer: "JURY",
   inventory_manager: "FETCHING_INVENTORY",
   fertigung_specialist: "FERTIGUNG",
   montage_manager: "MONTAGE",

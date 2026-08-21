@@ -31,6 +31,8 @@ Regeln:
 - logic_gaps: intern unstimmig (z.B. Maßangaben, Platzierung ohne Wandbezug).
 - missing_information: nötig für ein belastbares Konzept, aber weder Text noch Bild.
 - must_ask_user: konkrete Fragen (Deutsch), nur wenn blocking/gaps.
+- Keine Fragen zu optionalem Freiraum/Abstand zu vorhandenem Mobiliar, wenn der Nutzer
+  die Möbel-Außenmaße bereits genannt hat und Abstand nicht selbst verlangt.
 - Wenn Grundriss-PDF/Plan fehlt aber behauptet wird: als missing oder contradiction markieren.
 - Maximal 8 Einträge pro Liste.
 """
@@ -52,8 +54,13 @@ Antworte NUR mit JSON:
 }
 Regeln:
 - concept_issues: konkrete Mängel am Contract/Teileliste/Maßen/Platzierung vs. Fotos.
+- Referenzfotos/Grundriss vom Nutzer und erzeugte Konzept-Ansichten können multimodal beigefügt sein.
+  Behaupte NICHT, dass Bilder fehlen, wenn du sie siehst oder Referenz-IDs genannt sind.
+- Die Metadaten-Zeile „Konzeptbilder erzeugt: N“ zählt State-Einträge; die Bilder folgen multimodal danach.
+- Frage den Nutzer NICHT, ob Referenzbilder mitgeschickt wurden – prüfe die Anhänge.
 - ready_for_user = zur Nutzer-Freigabe vorlegen (auch mit gelisteten Restrisiken).
 - needs_revision / blocking = schwere Probleme, Nutzer muss entscheiden/klären.
+- Keine Pflichtfragen zu optionalem Abstand/Freiraum, wenn Außenmaße schon im Prompt stehen.
 - Maximal 8 Einträge pro Liste. Deutsch. Keine Schönfärberei.
 """
 
@@ -96,6 +103,62 @@ def format_coherence_block(report: dict[str, Any] | None) -> str:
             lines.extend(f"- {x}" for x in items[:8])
     lines.append("=== Ende Kohärenz-Prüfung ===")
     return "\n".join(lines)
+
+
+def _filter_spurious_findings(
+    report: dict[str, Any],
+    *,
+    ref_ids: list[str],
+    ref_images: int,
+    concept_images: int,
+) -> dict[str, Any]:
+    """Entfernt LLM-Fehlalarme (z. B. „Bilder fehlen“, obwohl multimodal beigefügt)."""
+    import copy
+
+    out = copy.deepcopy(report)
+
+    def _spurious(text: str) -> bool:
+        t = text.lower()
+        if ref_ids or ref_images > 0:
+            if ref_images > 0 and any(
+                p in t
+                for p in (
+                    "weder bilder noch",
+                    "nicht mitgeschickt",
+                    "keine referenzbilder",
+                    "referenzfoto fehlt",
+                    "bilder fehlen als",
+                )
+            ):
+                return True
+        if concept_images > 0:
+            if ("konzeptbild" in t or "konzeptbilder erzeugt" in t) and any(
+                p in t
+                for p in (
+                    "weder bilder",
+                    "liefert aber weder",
+                    "nicht zur prüfung",
+                    "weder bilder noch beschriebene",
+                )
+            ):
+                return True
+        if "konzeptbilder erzeugt:" in t and "liefert" in t:
+            return True
+        return False
+
+    for key in (
+        "contradictions",
+        "logic_gaps",
+        "missing_information",
+        "concept_issues",
+        "must_ask_user",
+        "assumptions_made_by_user_or_system",
+    ):
+        out[key] = [x for x in (out.get(key) or []) if not _spurious(str(x))]
+    if not (out.get("contradictions") or out.get("must_ask_user")):
+        if out.get("severity") == "blocking" and not out.get("concept_issues"):
+            out["severity"] = "gaps" if out.get("logic_gaps") or out.get("missing_information") else "ok"
+    return out
 
 
 def analyze_intake_coherence(state: AgentState) -> dict[str, Any]:
@@ -142,7 +205,16 @@ def analyze_intake_coherence(state: AgentState) -> dict[str, Any]:
         result["phase"] = "intake"
         result.setdefault("verdict", "ready_for_user")
         result.setdefault("severity", "gaps" if result.get("must_ask_user") else "ok")
-        return result
+        ref_ids = []
+        try:
+            from agents.reference_images import resolve_reference_asset_ids
+
+            ref_ids = resolve_reference_asset_ids(state_for_refs)
+        except Exception:  # noqa: BLE001
+            pass
+        return _filter_spurious_findings(
+            result, ref_ids=ref_ids, ref_images=len(images), concept_images=0
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Intake-Kohärenz fehlgeschlagen: %s", exc)
         return _empty_report(phase="intake")
@@ -150,14 +222,20 @@ def analyze_intake_coherence(state: AgentState) -> dict[str, Any]:
 
 def analyze_concept_coherence(state: AgentState) -> dict[str, Any]:
     """Prüft ausgearbeiteten Concept-Contract gegen Prompt + Referenzen."""
-    from agents.reference_images import load_reference_images_for_llm, reference_ground_truth_block
+    from agents.reference_images import (
+        load_review_images_for_llm,
+        reference_ground_truth_block,
+        resolve_reference_asset_ids,
+    )
 
-    images = load_reference_images_for_llm(state, limit=5)
+    all_images, ref_count, concept_count = load_review_images_for_llm(state, ref_limit=5, concept_limit=4)
+    ref_ids = resolve_reference_asset_ids(state)
     gt = reference_ground_truth_block(state)
     contract = state.get("requirements_contract") or {}
     vv = state.get("vv_requirements") or {}
     prior = state.get("coherence_critique") if isinstance(state.get("coherence_critique"), dict) else {}
     prompt = state.get("user_prompt") or ""
+    concept_meta = len(state.get("concept_image_urls") or [])
 
     if not is_llm_configured():
         report = _empty_report(phase="concept")
@@ -167,25 +245,33 @@ def analyze_concept_coherence(state: AgentState) -> dict[str, Any]:
     user_blob = (
         f"User-Prompt:\n{prompt[:3000]}\n\n"
         f"{gt}\n\n"
+        f"Referenz-Asset-IDs vom Nutzer: {', '.join(ref_ids) if ref_ids else '(keine)'}\n"
+        f"Referenzbilder multimodal beigefügt: {ref_count}\n"
         f"Frühere Intake-Findings:\n{format_coherence_block(prior)[:1500]}\n\n"
         f"V&V-Requirements:\n{str(vv)[:2000]}\n\n"
         f"Concept-Contract:\n{str(contract)[:3500]}\n\n"
-        f"Konzeptbilder erzeugt: {len(state.get('concept_image_urls') or [])}\n"
-        f"Referenzbilder multimodal: {len(images)}\n"
+        f"Konzept-Ansichten im State: {concept_meta}\n"
+        f"Konzeptbilder multimodal beigefügt: {concept_count}\n"
+        f"Hinweis: Nutzer-Referenzen wurden zu Beginn mitgeschickt – nicht erneut danach fragen.\n"
     )
     try:
         result = call_llm_json(
             _CONCEPT_SYSTEM,
             user_blob,
             max_tokens=2000,
-            images=images or None,
+            images=all_images or None,
         )
         if not isinstance(result, dict):
             return _empty_report(phase="concept")
         result["phase"] = "concept"
         result.setdefault("verdict", "ready_for_user")
         result.setdefault("severity", "ok")
-        return result
+        return _filter_spurious_findings(
+            result,
+            ref_ids=ref_ids,
+            ref_images=ref_count,
+            concept_images=concept_count,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Konzept-Kohärenz fehlgeschlagen: %s", exc)
         return _empty_report(phase="concept")
