@@ -96,6 +96,7 @@ function needsAiScan(item: InventoryItem): boolean {
   const text = aiNotesOf(item).toLowerCase();
   return (
     text.includes("kein vision-modell") ||
+    text.includes("kein cursor") ||
     text.includes("kein openai") ||
     text.includes("rohe cad-datei") ||
     text.includes("automatische heuristik") ||
@@ -130,9 +131,12 @@ function AssetDetail({
     userNotes.trim() !== userNotesOf(item) ||
     aiNotes.trim() !== aiNotesOf(item) ||
     (folderId || null) !== (item.folder_id ?? null);
-  const openaiReady = !!keyStatus?.openai_configured;
-  const showImageKeyHint = item.file_type === "image" && !openaiReady;
-  const showRescanHint = item.file_type === "image" && openaiReady && needsAiScan(item);
+  const visionReady =
+    !!keyStatus?.vision_configured ||
+    !!keyStatus?.cursor_configured ||
+    !!keyStatus?.anthropic_configured;
+  const showImageKeyHint = item.file_type === "image" && !visionReady;
+  const showRescanHint = item.file_type === "image" && visionReady && needsAiScan(item);
 
   useEffect(() => {
     setTitle(item.title ?? "");
@@ -262,12 +266,12 @@ function AssetDetail({
       {item.error_message && <p className="text-xs text-workshop-danger">{item.error_message}</p>}
       {showImageKeyHint && (
         <p className="text-[11px] text-workshop-warning">
-          Für Bildbeschreibungen fehlt der OpenAI-API-Key unter Einstellungen.
+          Für Bildbeschreibungen fehlt der Cursor-API-Key (oder Anthropic) unter Einstellungen.
         </p>
       )}
       {showRescanHint && (
         <p className="text-[11px] text-workshop-muted">
-          Noch Heuristik-Text – mit „KI beschreiben“ per OpenAI neu scannen (deine Beschreibung bleibt erhalten).
+          Noch Heuristik-Text – mit „KI beschreiben“ per Cursor neu scannen (deine Beschreibung bleibt erhalten).
         </p>
       )}
       {process.isError && (

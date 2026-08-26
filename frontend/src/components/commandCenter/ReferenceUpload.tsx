@@ -314,6 +314,24 @@ export function ReferenceUpload({
     setFocusedId(null);
   };
 
+  const selectFolder = (id: "all" | "unassigned" | string) => {
+    setPickerFolderFilter(id);
+    setFocusedId(null);
+    setSelectedIds(new Set());
+  };
+
+  const folderEntries = useMemo(
+    () => [
+      { id: "all" as const, label: "Alle" },
+      { id: "unassigned" as const, label: "Ohne Ordner" },
+      ...folders.map((f) => ({
+        id: f.id,
+        label: f.item_count > 0 ? `${f.name} (${f.item_count})` : f.name,
+      })),
+    ],
+    [folders],
+  );
+
   const pickerModal =
     pickerOpen &&
     createPortal(
@@ -332,28 +350,9 @@ export function ReferenceUpload({
             <div className="min-w-0 flex-1">
               <h2 className="text-base font-semibold text-workshop-text">Inventar – große Vorschau</h2>
               <p className="text-xs text-workshop-muted">
-                Eintrag tippen → Bild rechts im Model Viewer · Checkbox = Mehrfachauswahl
+                Ordner wählen · Eintrag tippen → Vorschau · Checkbox = Mehrfachauswahl
               </p>
             </div>
-            <select
-              value={pickerFolderFilter}
-              onChange={(e) => {
-                setPickerFolderFilter(e.target.value);
-                setFocusedId(null);
-                setSelectedIds(new Set());
-              }}
-              className="rounded-md border border-workshop-border bg-workshop-panel px-2 py-2 text-sm text-workshop-text focus:border-workshop-accent focus:outline-none"
-              aria-label="Ordner filtern"
-            >
-              <option value="all">Alle Ordner</option>
-              <option value="unassigned">Ohne Ordner</option>
-              {folders.map((folder) => (
-                <option key={folder.id} value={folder.id}>
-                  {folder.name}
-                  {folder.item_count > 0 ? ` (${folder.item_count})` : ""}
-                </option>
-              ))}
-            </select>
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
@@ -369,13 +368,47 @@ export function ReferenceUpload({
             </button>
           </div>
 
-          <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[1fr_minmax(320px,42%)]">
+          <div className="shrink-0 border-b border-workshop-border bg-workshop-panel/40 px-3 py-2">
+            <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-workshop-accent">
+              Ordner filtern
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {folderEntries.map((entry) => {
+                const active = pickerFolderFilter === entry.id;
+                return (
+                  <button
+                    key={entry.id}
+                    type="button"
+                    onClick={() => selectFolder(entry.id)}
+                    className={`rounded-md border px-2.5 py-1 text-xs font-medium transition ${
+                      active
+                        ? "border-workshop-accent bg-workshop-accent text-workshop-bg"
+                        : "border-workshop-border bg-workshop-bg text-workshop-muted hover:border-workshop-accent hover:text-workshop-text"
+                    }`}
+                  >
+                    {entry.label}
+                  </button>
+                );
+              })}
+              {folders.length === 0 && (
+                <span className="text-[11px] text-workshop-muted">
+                  Keine Ordner angelegt – unter „Inventory Database“ erstellen.
+                </span>
+              )}
+            </div>
+          </div>
+
+          <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[1fr_minmax(280px,38%)]">
             <div className="min-h-0 overflow-y-auto border-b border-workshop-border p-3 lg:border-b-0 lg:border-r">
               {(isLoading || isFetching) && items.length === 0 && (
                 <p className="text-sm text-workshop-muted">Lade Inventar…</p>
               )}
-              {!isLoading && items.length === 0 && (
-                <p className="text-sm text-workshop-muted">Keine Einträge gefunden.</p>
+              {!isLoading && !isFetching && items.length === 0 && (
+                <p className="text-sm text-workshop-muted">
+                  {pickerFolderFilter === "all"
+                    ? "Keine Einträge gefunden."
+                    : "Keine Einträge in diesem Ordner."}
+                </p>
               )}
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-4">
                 {items.slice(0, 80).map((item) => {
@@ -449,6 +482,14 @@ export function ReferenceUpload({
             <div className="flex min-h-[240px] flex-col bg-workshop-panel/30 p-3 lg:min-h-0">
               <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-workshop-muted">
                 Model-Viewer-Vorschau
+                {pickerFolderFilter !== "all" && (
+                  <span className="ml-2 font-normal normal-case text-workshop-accent">
+                    ·{" "}
+                    {pickerFolderFilter === "unassigned"
+                      ? "Ohne Ordner"
+                      : folderNameById.get(pickerFolderFilter) ?? "Ordner"}
+                  </span>
+                )}
               </div>
               <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-lg border border-workshop-border bg-black/50 p-2">
                 {focusedItem?.file_path ? (

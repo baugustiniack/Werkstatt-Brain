@@ -183,6 +183,8 @@ export function ConceptStage({ cad }: { cad: UseCadStreamResult }) {
     return [...mapped].sort((a, b) => rank(a.kind) - rank(b.kind));
   }, [cad.conceptImageUrl, cad.conceptImageUrls, cad.escalation]);
 
+  const sketchSvg = cad.conceptSketchSvg ?? cad.escalation?.concept_sketch_svg ?? null;
+
   useEffect(() => {
     const overviewIdx = images.findIndex((g) => g.kind === "overview");
     setActiveIdx(overviewIdx >= 0 ? overviewIdx : 0);
@@ -341,6 +343,10 @@ export function ConceptStage({ cad }: { cad: UseCadStreamResult }) {
       <div className="relative min-h-[140px] flex-1 overflow-hidden rounded-md border border-workshop-border bg-black/40">
         {active ? (
           <img src={active.url} alt={active.label} className="h-full w-full object-contain" />
+        ) : sketchSvg ? (
+          <div className="h-full min-h-[220px] overflow-auto bg-white p-2">
+            <div dangerouslySetInnerHTML={{ __html: sketchSvg }} />
+          </div>
         ) : (
           <div className="flex h-full min-h-[220px] flex-col items-center justify-center gap-2 px-4 text-center text-xs text-workshop-muted">
             <span className="font-semibold text-workshop-text">Konzeptphase läuft</span>

@@ -12,6 +12,7 @@ import logging
 from app.config import settings
 from app.db.postgres import SessionLocal
 from app.models.app_setting import AppSetting
+from app.services.agent_workflow_store import is_agent_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,19 @@ ANTHROPIC_API_KEY_SETTING = "anthropic_api_key"
 OPENAI_API_KEY_SETTING = "openai_api_key"
 CURSOR_API_KEY_SETTING = "cursor_api_key"
 LLM_PROVIDER_SETTING = "llm_provider"  # "auto" | "anthropic" | "cursor"
+CONCEPT_ROSTER_MODE_SETTING = "concept_roster_mode"  # "auto" | "manual"
+CONCEPT_ROSTER_AGENTS_SETTING = "concept_roster_agents"  # JSON list of agent ids
+
+# Wählbare Spezialisten/Jury für die Konzeptphase (Builder läuft immer)
+CONCEPT_ROSTER_SELECTABLE = (
+    "flexible_specialist",
+    "interior_architect",
+    "vv_manager",
+    "concept_critic",
+    "fertigung_specialist",
+)
+
+DEFAULT_MANUAL_CONCEPT_ROSTER = ("interior_architect", "vv_manager", "concept_critic")
 
 
 def get_setting(key: str) -> str | None:
@@ -74,12 +88,16 @@ def is_llm_configured() -> bool:
     return is_anthropic_configured() or is_cursor_configured()
 
 
+def is_vision_configured() -> bool:
+    """Bild→Text (Inventar, Referenzfotos): Cursor oder Anthropic; OpenAI optional separat."""
+    return is_cursor_configured() or is_anthropic_configured() or bool(resolve_openai_api_key())
+
+
 def resolve_llm_provider() -> str:
     """Effektiver Provider: UI-Wahl (`auto`/`anthropic`/`cursor`), sonst Auto-Auswahl.
 
-    Auto: Anthropic zuerst (schneller Direkt-API-Call + Vision), sonst Cursor.
-    Explizite Wahl wird nur genutzt, wenn der gewählte Key auch wirklich gesetzt ist;
-    sonst Fallback auf den anderen konfigurierten Provider.
+    Auto: Cursor zuerst (Abo/Kosten), sonst Anthropic. OpenAI ist kein Text-LLM hier.
+    Explizite Wahl nur, wenn der gewählte Key gesetzt ist; sonst Fallback.
     """
     preferred = (get_setting(LLM_PROVIDER_SETTING) or "auto").strip().lower()
     if preferred not in ("auto", "anthropic", "cursor"):
@@ -92,8 +110,36 @@ def resolve_llm_provider() -> str:
         return "anthropic"
     if preferred == "cursor" and cursor_ok:
         return "cursor"
-    if anthropic_ok:
-        return "anthropic"
     if cursor_ok:
         return "cursor"
+    if anthropic_ok:
+        return "anthropic"
     return "none"
+
+
+def resolve_concept_roster_mode() -> str:
+    """auto = Supervisor wählt; manual = Nutzer-Liste aus Settings."""
+    raw = (get_setting(CONCEPT_ROSTER_MODE_SETTING) or "auto").strip().lower()
+    return raw if raw in ("auto", "manual") else "auto"
+
+
+def resolve_manual_concept_roster() -> list[str]:
+    """Persistierte Nutzer-Auswahl, gefiltert auf aktivierte Agenten."""
+    import json
+
+    raw = get_setting(CONCEPT_ROSTER_AGENTS_SETTING)
+    ids: list[str] = []
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                ids = [str(x).strip() for x in parsed if str(x).strip()]
+        except json.JSONDecodeError:
+            ids = [p.strip() for p in raw.split(",") if p.strip()]
+    if not ids:
+        ids = list(DEFAULT_MANUAL_CONCEPT_ROSTER)
+    allowed = set(CONCEPT_ROSTER_SELECTABLE)
+    picked = [aid for aid in ids if aid in allowed and is_agent_enabled(aid)]
+    if picked:
+        return picked
+    return [aid for aid in DEFAULT_MANUAL_CONCEPT_ROSTER if is_agent_enabled(aid)]

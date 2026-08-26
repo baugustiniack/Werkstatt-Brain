@@ -26,6 +26,7 @@ für eine Werkstatt-Anfrage (CNC, Holz, Möbel, Inventar). Antworte NUR mit JSON
   "advice_priorities": [string, ...]
 }
 Das Profil muss spezifisch zur Anfrage sein (nicht generisch „Holzexperte“).
+Kein Innenarchitektur-Vollplan: Fokus Werkstatt-Machbarkeit, Material, CNC, Inventar.
 """
 
 _ADVICE_SYSTEM = """Du bist der Flexible Specialist mit dem gegebenen Profil.
@@ -37,7 +38,15 @@ Berate kurz die anderen Agenten (V&V, Concept, Inventory, Fertigung). Antworte N
   "suggestions_for_concept": [string, ...],
   "suggestions_for_manufacturing": [string, ...]
 }
-Deutsch, konkret, max. 1 Seite Äquivalent.
+Regeln (streng):
+- Nur aus User-Prompt und sichtbaren Referenzbildern/Grundriss ableiten.
+- Maße nur übernehmen, wenn sie im Prompt oder Plan stehen – keine Katalog-/IKEA-Standardmaße erfinden.
+- Keine fertigen Raumlayouts mit Nord/Ost/Süd/West-Wandzuweisungen erfinden, wenn der Nutzer das nicht verlangt.
+- Beispiele des Nutzers („z. B. Ikea Pax“) sind Optionen, keine festen Modulbreiten/Produktmaße.
+- Keine TV-Zollgrößen, Mindestabstände oder Produktvarianten erfinden, die nicht genannt wurden.
+- Unterscheide klar: „im Plan abgelesen“ vs. „Annahme / Vorschlag zum Prüfen“.
+- Rolle: Machbarkeit & Risiken – nicht Interior Architect (kein verbindliches Möblierungskonzept).
+Deutsch, konkret, kurz (max. ~½ Seite).
 """
 
 
@@ -109,8 +118,8 @@ def flexible_specialist_node(state: AgentState) -> AgentState:
     )
     if ref_images:
         user_blob += (
-            f"\n{len(ref_images)} Referenzfoto(s) sind als Bilder angehängt – "
-            "berücksichtige Raum, Stil und vorhandene Objekte in deiner Beratung."
+            f"\n{len(ref_images)} Referenzfoto(s)/Pläne sind als Bilder angehängt – "
+            "übernimm nur ablesbare Fakten; erfinde keine Produktmaße oder Wandlayouts."
         )
 
     advice: dict[str, Any]

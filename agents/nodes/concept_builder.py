@@ -208,7 +208,13 @@ def _llm_decompose_request(
         user_message += (
             f"\n\nBisheriger Entwurf: {prev_json}\n"
             f"{label}: {feedback}\n"
-            "Überarbeite den Entwurf entsprechend – Referenzfotos bleiben Ground Truth. "
+            "Überarbeite den Entwurf sichtbar und verbindlich – Referenzfotos bleiben Ground Truth.\n"
+            "PFLICHT bei Überarbeitung:\n"
+            "- Ändere mindestens Position/Anordnung (position_xy_mm) und/oder Aufteilung der Teile, "
+            "wenn Kritik Raumtreue/Platzierung betrifft – kein kosmetisches Umschreiben gleicher Maße.\n"
+            "- Die nächste Konzept-Galerie muss sich vom Vorentwurf unterscheiden (andere Möbelstellung).\n"
+            "- Erfinde keine Fertigungsdetails (Plattenzuschnitt, CNC), wenn der Nutzer nur einen "
+            "Lageplan/Grundriss-Einrichtungskonzept verlangt.\n"
             + (
                 "Priorität: schlechteste Jury-Noten anheben; Note 5/6 ist inakzeptabel."
                 if jury_rev
@@ -492,50 +498,12 @@ def concept_builder_node(state: AgentState) -> AgentState:
 
     concept_image_url = None
     concept_image_urls: list[dict] = []
-    try:
-        from agents.nodes.interior_architect import enrich_interior_views_from_parts
-        from app.services.concept_image import generate_concept_gallery
-
-        interior = state.get("interior_brief") if isinstance(state.get("interior_brief"), dict) else {}
-        if ref_ids or brief_text:
-            interior = {**interior, "need_floorplan": True, "is_room_concept": True}
-        room_plan = enrich_interior_views_from_parts(dict(interior or {}), concept["parts"])
-        logger.info(
-            "Konzept-Views geplant: %s",
-            [(v.get("kind"), v.get("label")) for v in (room_plan.get("suggested_views") or [])],
-        )
-        gallery = generate_concept_gallery(
-            session_id=state.get("session_id") or "anonymous",
-            project_title=concept["project_title"],
-            user_prompt=state["user_prompt"],
-            parts=concept["parts"],
-            views=room_plan.get("suggested_views"),
-            interior_brief={**room_plan, "reference_vision_brief": brief_text},
-            max_images=5,
-            asset_ids=ref_ids or None,
-        )
-        concept_image_urls = gallery
-        concept_image_url = gallery[0]["url"] if gallery else None
-        from app.services.concept_image import ensure_gallery_urls
-
-        concept_image_urls = ensure_gallery_urls(
-            state.get("session_id") or "anonymous",
-            concept_image_urls,
-        )
-        concept_image_url = concept_image_urls[0]["url"] if concept_image_urls else concept_image_url
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Konzept-Galerie übersprungen: %s", exc)
 
     verb = "überarbeitet" if is_concept_feedback else "erstellt"
-    n_imgs = len(concept_image_urls)
-    photo_note = (
-        f" {n_imgs} Konzept-Ansicht(en) erzeugt."
-        if n_imgs
-        else " (kein Foto – OpenAI-Key fehlt oder Generierung fehlgeschlagen)."
-    )
     note = (
         f"Entwurf {verb}: {concept['project_title']} ({len(concept['parts'])} Teil(e))."
-        f"{photo_note} → Konzept-Kritik folgt."
+        " Skizze (SVG) bereit – KI-Visualisierung optional bei Freigabe."
+        " → Konzept-Kritik folgt."
     )
 
     return {

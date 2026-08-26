@@ -145,6 +145,8 @@ export interface EscalationPayload {
   concept_complexity?: string | null;
   concept_roster?: string[] | null;
   concept_complexity_reasons?: string[] | null;
+  /** Fehlermeldung wenn „Visualisieren“ fehlschlug */
+  visualize_error?: string | null;
   vv_requirements?: {
     title?: string;
     phase?: string;
@@ -164,6 +166,7 @@ export interface EscalationPayload {
 /** Entscheidung des Nutzers auf eine Freigabe-Eskalation. */
 export type ConceptDecision =
   | { decision: "approve" }
+  | { decision: "visualize" }
   | { decision: "revise"; feedback?: string; user_grade?: number }
   | { decision: "next_round"; feedback?: string; user_grade?: number }
   | { decision: "answer"; answer: string };
@@ -390,7 +393,13 @@ export interface ApiKeyStatusResponse {
   cursor_configured: boolean;
   llm_provider: LlmProviderChoice;
   active_provider: "anthropic" | "cursor" | "none" | string;
+  vision_configured: boolean;
+  concept_roster_mode: ConceptRosterMode;
+  concept_roster_agents: string[];
+  concept_roster_selectable: string[];
 }
+
+export type ConceptRosterMode = "auto" | "manual";
 
 export type LlmProviderChoice = "auto" | "anthropic" | "cursor";
 

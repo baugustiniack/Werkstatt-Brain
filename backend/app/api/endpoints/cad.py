@@ -170,6 +170,14 @@ class CadGenerateRequest(BaseModel):
             "(vermeidet Duplikate)."
         ),
     )
+    concept_roster_mode: Literal["auto", "manual"] | None = Field(
+        None,
+        description="Optional pro Lauf: auto = Supervisor wählt Agenten; manual = concept_roster nutzen.",
+    )
+    concept_roster: list[str] | None = Field(
+        None,
+        description="Bei manual: beteiligte Konzept-Agenten (flexible_specialist, interior_architect, …).",
+    )
 
 
 class CadPendingResponse(BaseModel):
@@ -362,6 +370,11 @@ def _format_escalation_user_message(decision: Any, escalation: dict[str, Any] | 
     feedback = str(
         decision.get("feedback") or decision.get("note") or decision.get("answer") or ""
     ).strip()
+
+    if decision.get("decision") == "visualize":
+        if reason == "concept_approval":
+            return "Konzept visualisieren (KI-Galerie generieren)."
+        return "Visualisierung anfordern."
 
     if decision.get("decision") == "revise" or decision.get("decision") == "next_round" or decision.get("approved") is False:
         if reason == "concept_approval":
@@ -696,6 +709,14 @@ async def generate_cad(request: CadGenerateRequest) -> CadWorkflowResponse | Cad
         "human_approval_required": False,
         "messages": [{"role": "user", "content": prompt}],
     }
+    if request.concept_roster_mode:
+        initial_state["concept_roster_mode"] = request.concept_roster_mode
+    if request.concept_roster:
+        initial_state["concept_roster"] = request.concept_roster
+    elif request.concept_roster_mode == "manual":
+        from app.services.settings_store import resolve_manual_concept_roster
+
+        initial_state["concept_roster"] = resolve_manual_concept_roster()
     try:
         from app.services.reference_assets import extract_reference_asset_ids
 

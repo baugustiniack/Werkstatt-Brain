@@ -365,7 +365,7 @@ class ConceptToInventoryRequest(BaseModel):
     session_id: str = Field(..., description="CAD-Session mit generiertem Konzept-Foto")
     conversation_id: str | None = Field(None, description="Chat-Unterhaltung zur Verknüpfung")
     title: str | None = Field(None, description="Anzeigename in der Inventar-DB")
-    auto_process: bool = Field(True, description="Sofort per OpenAI Vision beschreiben")
+    auto_process: bool = Field(True, description="Sofort per Cursor/Anthropic (Bild→Text) beschreiben")
 
 
 class ConceptToInventoryResponse(BaseModel):

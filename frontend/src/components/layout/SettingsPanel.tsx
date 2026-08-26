@@ -1,11 +1,12 @@
 import { useState } from "react";
 
 import { useApiKeyStatus, useUpdateApiKeys } from "../../hooks/useSettings";
-import type { LlmProviderChoice } from "../../api/types";
+import type { ConceptRosterMode, LlmProviderChoice } from "../../api/types";
+import { ConceptRosterPicker } from "../conversation/ConceptRosterPicker";
 
 /**
  * Einstellungen-Modal: optionale Anthropic-, Cursor- und OpenAI-API-Keys.
- * Bildbeschreibungen in der Inventar-DB nutzen ausschließlich OpenAI Vision.
+ * Einstellungen: Cursor für Bild→Text & Agenten; OpenAI nur optional für Konzept-Fotos.
  */
 export function SettingsPanel({ onClose }: { onClose: () => void }) {
   const { data: status, isLoading } = useApiKeyStatus();
@@ -33,6 +34,14 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
     update.mutate({ llm_provider });
   };
 
+  const setConceptRosterMode = (concept_roster_mode: ConceptRosterMode) => {
+    update.mutate({ concept_roster_mode });
+  };
+
+  const setConceptRosterAgents = (concept_roster_agents: string[]) => {
+    update.mutate({ concept_roster_agents });
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
       <div
@@ -47,9 +56,10 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
         </div>
 
         <p className="mb-4 text-xs text-workshop-muted">
-          Keys sind optional. <strong className="text-workshop-text">Bilder &amp; Inventar-Fotos</strong> sowie
-          Konzept-Fotos brauchen <strong className="text-workshop-text">OpenAI</strong>. Concept Builder &amp; 3D
-          Builder: Anthropic oder Cursor. PDF/STL-Beschreibungen: Anthropic oder Cursor.
+          Keys sind optional. <strong className="text-workshop-text">Bild→Text</strong> (Inventar,
+          Referenzfotos, Jury): <strong className="text-workshop-text">Cursor</strong> (Provider „Cursor“
+          oder Auto). OpenAI nur für fotorealistische <strong className="text-workshop-text">Konzept-Galerie</strong>{" "}
+          – kann leer bleiben, wenn du keine KI-Renders brauchst.
         </p>
 
         {/* Provider-Wahl */}
@@ -76,8 +86,8 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
           <span className="font-semibold text-workshop-text">
             {isLoading ? "…" : status?.active_provider === "none" ? "keiner (Heuristik)" : status?.active_provider}
           </span>
-          {status?.llm_provider === "auto" && " · Auto: Anthropic-Key falls vorhanden, sonst Cursor"}
-          {" · Cursor = Agenten (+ Referenzfotos im Workspace); OpenAI = Konzeptbild-Generierung"}
+          {status?.llm_provider === "auto" && " · Auto: Cursor-Key zuerst, sonst Anthropic"}
+          {" · OpenAI = nur Konzeptbild-Generierung (Images API)"}
         </p>
 
         {/* Anthropic */}
@@ -127,7 +137,8 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
         {/* Cursor */}
         <label className="mb-1 block text-xs font-semibold text-workshop-muted">Cursor API-Key</label>
         <p className="mb-2 text-xs text-workshop-muted">
-          Concept Builder &amp; 3D Builder über Cursor SDK (Composer). Keine Bildgenerierung – Fotos brauchen OpenAI.
+          Agenten-Text, Referenzfotos und Inventar-Bild→Text über Cursor SDK. OpenAI nur optional für
+          Konzept-Galerie (Images API).
         </p>
         <div className="mb-2 flex items-center gap-2 text-xs">
           <span
@@ -169,7 +180,8 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
         {/* OpenAI – Konzept-Fotos */}
         <label className="mb-1 block text-xs font-semibold text-workshop-muted">OpenAI API-Key</label>
         <p className="mb-2 text-xs text-workshop-muted">
-          Inventar-Bildbeschreibungen (Vision) und fotorealistische Konzept-Fotos (Images API).
+          Optional: fotorealistische Konzept-Galerie (Images API). Bildbeschreibungen laufen über Cursor –
+          OpenAI-Key kann leer bleiben.
         </p>
         <div className="mb-2 flex items-center gap-2 text-xs">
           <span
@@ -201,11 +213,25 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
             type="button"
             onClick={() => update.mutate({ openai_api_key: "" })}
             disabled={update.isPending}
-            className="text-xs text-workshop-danger hover:underline"
+            className="mb-4 text-xs text-workshop-danger hover:underline"
           >
             OpenAI-Key entfernen
           </button>
         )}
+        {!status?.openai_configured && <div className="mb-4" />}
+
+        <label className="mb-1 block text-xs font-semibold text-workshop-muted">Konzept-Agenten</label>
+        <p className="mb-2 text-xs text-workshop-muted">
+          Wer an Intake und Jury teilnimmt, bevor der Concept Builder den Entwurf erstellt.
+        </p>
+        <ConceptRosterPicker
+          mode={status?.concept_roster_mode ?? "auto"}
+          agents={status?.concept_roster_agents ?? []}
+          selectable={status?.concept_roster_selectable}
+          onModeChange={setConceptRosterMode}
+          onAgentsChange={setConceptRosterAgents}
+          disabled={update.isPending || isLoading}
+        />
       </div>
     </div>
   );

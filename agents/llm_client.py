@@ -5,7 +5,7 @@ Unterstützt zwei optionale Provider (Nutzer-Feedback: Anthropic- und Cursor-
 API-Key parallel hinterlegbar):
 - Anthropic: direkter Claude-API-Call (schnell, auch Vision)
 - Cursor: `cursor-sdk` Agent.prompt; Referenzfotos als Dateien im Temp-CWD
-- OpenAI: Konzeptbild-Generierung (+ optionaler Vision-Fallback)
+- OpenAI: nur Konzeptbild-Generierung (images API), kein Standard für Bild→Text
 
 Aufrufer MÜSSEN selbst einen Heuristik-/Template-Fallback bereitstellen, falls
 `is_llm_configured()` False liefert oder ein Call fehlschlägt – der Graph darf
@@ -195,6 +195,47 @@ def _call_cursor_text(
     return text
 
 
+def _vision_text_chain(
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+    *,
+    images: list[tuple[bytes, str]],
+) -> str:
+    """Bild→Text: Cursor zuerst (wenn Key da), dann Anthropic; OpenAI nur als letzter Fallback."""
+    last_error: Exception | None = None
+
+    if settings_store.resolve_cursor_api_key():
+        try:
+            logger.info("Vision-LLM: Cursor mit %s Bilddatei(en) im Workspace", len(images))
+            return _call_cursor_text(system_prompt, user_prompt, images=images)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            logger.warning("Cursor-Vision fehlgeschlagen: %s", exc)
+
+    if settings_store.resolve_anthropic_api_key():
+        try:
+            logger.info("Vision-LLM: Anthropic mit %s Bild(ern)", len(images))
+            return _call_anthropic_text(system_prompt, user_prompt, max_tokens, images=images)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            logger.warning("Anthropic-Vision fehlgeschlagen: %s", exc)
+
+    if settings_store.resolve_openai_api_key():
+        try:
+            logger.info("Vision-LLM: OpenAI-Fallback (letzter Ausweg) mit %s Bild(ern)", len(images))
+            return _call_openai_vision_text(system_prompt, user_prompt, max_tokens, images=images)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            logger.warning("OpenAI-Vision fehlgeschlagen: %s", exc)
+
+    if last_error:
+        raise last_error
+    raise RuntimeError(
+        "Kein Vision-Provider: Cursor- oder Anthropic-API-Key in Einstellungen hinterlegen."
+    )
+
+
 def call_llm_text(
     system_prompt: str,
     user_prompt: str,
@@ -204,40 +245,16 @@ def call_llm_text(
 ) -> str:
     """Roher Text-Call; optional Bilder.
 
-    Bei Cursor-Provider: Fotos als Dateien im Agent-Workspace (kein Anthropic nötig).
-    Fallback: OpenAI Vision. Anthropic nur wenn Key vorhanden.
+    Bild→Text läuft über Cursor (Workspace-Dateien), nicht über OpenAI.
     """
     provider = settings_store.resolve_llm_provider()
     has_images = bool(images)
 
     if has_images:
-        # 1) Cursor (gewählter Provider oder Auto mit Cursor-Key ohne Anthropic)
-        if provider == "cursor" or (
-            provider == "auto"
-            and settings_store.resolve_cursor_api_key()
-            and not settings_store.resolve_anthropic_api_key()
-        ):
-            if settings_store.resolve_cursor_api_key():
-                try:
-                    logger.info("Vision-LLM: Cursor mit %s Bilddatei(en) im Workspace", len(images))
-                    return _call_cursor_text(system_prompt, user_prompt, images=images)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Cursor-Vision (Workspace-Dateien) fehlgeschlagen: %s", exc)
-        # 2) Anthropic Vision (optional)
-        if settings_store.resolve_anthropic_api_key():
-            try:
-                logger.info("Vision-LLM: Anthropic mit %s Bild(ern)", len(images))
-                return _call_anthropic_text(system_prompt, user_prompt, max_tokens, images=images)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Anthropic-Vision fehlgeschlagen: %s", exc)
-        # 3) OpenAI Vision Fallback
-        if settings_store.resolve_openai_api_key():
-            try:
-                logger.info("Vision-LLM: OpenAI-Fallback mit %s Bild(ern)", len(images))
-                return _call_openai_vision_text(system_prompt, user_prompt, max_tokens, images=images)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("OpenAI-Vision fehlgeschlagen: %s", exc)
-        logger.warning("Referenzbilder vorhanden, aber kein Vision-Pfad erfolgreich (%s)", provider)
+        try:
+            return _vision_text_chain(system_prompt, user_prompt, max_tokens, images=images or [])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Referenz-Vision fehlgeschlagen (%s): %s", provider, exc)
 
     text_prompt = user_prompt
     if has_images:
@@ -267,34 +284,10 @@ def call_vision_prefer_anthropic(
     *,
     max_tokens: int = 2048,
 ) -> str:
-    """Referenzfoto-Analyse: Cursor (Workspace) zuerst wenn Provider=Cursor, sonst Anthropic/OpenAI.
-
-    Name historisch; ohne Anthropic-Key läuft der Cursor-Pfad.
-    """
+    """Referenzfoto-Analyse – Cursor zuerst (Name historisch)."""
     if not images:
         return call_llm_text(system_prompt, user_prompt, max_tokens=max_tokens)
-
-    provider = settings_store.resolve_llm_provider()
-    # Cursor-Modelle: Bilder als Dateien im Agent-CWD
-    if settings_store.resolve_cursor_api_key() and provider in ("cursor", "auto"):
-        try:
-            logger.info("Referenz-Vision: Cursor-Workspace mit %s Bild(ern)", len(images))
-            return _call_cursor_text(system_prompt, user_prompt, images=images)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Cursor-Referenz-Vision fehlgeschlagen: %s", exc)
-
-    if settings_store.resolve_anthropic_api_key():
-        try:
-            logger.info("Referenz-Vision: Anthropic (%s Bild(er))", len(images))
-            return _call_anthropic_text(system_prompt, user_prompt, max_tokens, images=images)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Anthropic-Referenz-Vision fehlgeschlagen: %s", exc)
-
-    if settings_store.resolve_openai_api_key():
-        logger.info("Referenz-Vision: OpenAI-Fallback (%s Bild(er))", len(images))
-        return _call_openai_vision_text(system_prompt, user_prompt, max_tokens, images=images)
-
-    raise RuntimeError("Kein Vision-fähiger Pfad (Cursor/Anthropic/OpenAI) für Referenzfotos.")
+    return _vision_text_chain(system_prompt, user_prompt, max_tokens, images=images)
 
 
 def call_llm_json(

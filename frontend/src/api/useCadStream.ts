@@ -8,6 +8,7 @@ import type {
   CadWorkflowResult,
   CompletedPart,
   ConceptDecision,
+  ConceptRosterMode,
   EscalationPayload,
   RequirementsContract,
 } from "./types";
@@ -257,7 +258,15 @@ export function useCadStream(): UseCadStreamResult {
   }, []);
 
   const start = useCallback(
-    async (prompt: string, conversationId?: string | null, opts?: { persistUserMessage?: boolean }) => {
+    async (
+      prompt: string,
+      conversationId?: string | null,
+      opts?: {
+        persistUserMessage?: boolean;
+        conceptRosterMode?: ConceptRosterMode;
+        conceptRoster?: string[];
+      },
+    ) => {
       // Nur Run-State zurücksetzen – Chat bleibt in der Conversation-API.
       const prevSocket = socketRef.current;
       socketRef.current = null;
@@ -276,6 +285,10 @@ export function useCadStream(): UseCadStreamResult {
           prompt,
           conversation_id: conversationId || undefined,
           persist_user_message: opts?.persistUserMessage !== false,
+          ...(opts?.conceptRosterMode ? { concept_roster_mode: opts.conceptRosterMode } : {}),
+          ...(opts?.conceptRosterMode === "manual" && opts.conceptRoster?.length
+            ? { concept_roster: opts.conceptRoster }
+            : {}),
         });
         sessionIdRef.current = pending.session_id;
         setSessionId(pending.session_id);

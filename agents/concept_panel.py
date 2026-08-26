@@ -207,7 +207,8 @@ def build_revision_feedback(
 ) -> str:
     lines = [
         "Jury-Noten optimieren: Korrektur gemäß Nutzer- und Jury-Feedback.",
-        "Bei Nutzer-Rückmeldung zu Grundriss/Raum: Platzierung und Proportionen dürfen angepasst werden.",
+        "Bei Nutzer-Rückmeldung zu Grundriss/Raum: Platzierung und Proportionen MÜSSEN sich sichtbar ändern "
+        "(nicht nur Text im Contract umformulieren).",
         "Hartes Kriterium: keine Note 5 oder 6. Es gibt keinen Pflicht-Schnitt von 2,0.",
         f"Aktueller Schnitt: {average if average is not None else 'n/a'}"
         + (f" (vorher {previous_average})" if previous_average is not None else "")

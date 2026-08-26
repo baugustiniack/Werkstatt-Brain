@@ -4,6 +4,7 @@ import { useState } from "react";
 
 import type { ConceptDecision, EscalationPayload } from "../../api/types";
 import { apiBaseUrl } from "../../api/client";
+import { assetFileUrl } from "../inventory/AssetPreview";
 
 interface EscalationDialogProps {
   escalation: EscalationPayload;
@@ -19,6 +20,38 @@ function normalizeReason(reason: string | undefined | null): string {
   return String(reason || "")
     .trim()
     .toLowerCase();
+}
+
+/** Upload-/Inventar-Referenzen aus dem Chat – keine KI-Konzept-Galerie. */
+function ReferenceUploadGallery({ assetIds }: { assetIds: string[] }) {
+  if (assetIds.length === 0) return null;
+  return (
+    <div className="rounded border border-workshop-accent/50 bg-workshop-panel/70 p-2">
+      <div className="mb-2 text-[10px] font-semibold uppercase tracking-wide text-workshop-accent">
+        Angehängte Referenzbilder ({assetIds.length})
+      </div>
+      <div className={`grid gap-2 ${assetIds.length > 1 ? "sm:grid-cols-2" : "grid-cols-1"}`}>
+        {assetIds.slice(0, 6).map((id) => (
+          <a
+            key={id}
+            href={assetFileUrl(id)}
+            target="_blank"
+            rel="noreferrer"
+            className="block overflow-hidden rounded border border-workshop-border bg-black/30"
+            title={`Referenz ${id}`}
+          >
+            <img
+              src={assetFileUrl(id)}
+              alt="Referenz-Upload"
+              className="max-h-52 w-full object-contain"
+              loading="lazy"
+            />
+          </a>
+        ))}
+      </div>
+      <p className="mt-1.5 text-[10px] text-workshop-muted">Klicken zum Vergrößern · Original aus dem Inventar</p>
+    </div>
+  );
 }
 
 function ConceptApprovalDialog({ escalation, onDecision }: EscalationDialogProps) {
@@ -126,6 +159,10 @@ export function ClarificationPanel({
     resolveMediaUrl(escalation.concept_image_urls?.[0]?.url) ||
     resolveMediaUrl(escalation.concept_image_url);
 
+  const referenceAssetIds = (escalation.reference_asset_ids ?? []).filter(Boolean);
+  const showReferenceUploads = referenceAssetIds.length > 0;
+  const showConceptPreview = !showReferenceUploads && !!previewUrl;
+
   const parts = escalation.requirements_contract?.parts ?? [];
 
   const body = (
@@ -156,13 +193,15 @@ export function ClarificationPanel({
             : "min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-3 sm:px-5"
         }
       >
-        {(parts.length > 0 || previewUrl) && (
+        {showReferenceUploads && <ReferenceUploadGallery assetIds={referenceAssetIds} />}
+
+        {(parts.length > 0 || showConceptPreview) && (
           <div className="rounded border border-workshop-border/70 bg-black/20 p-2">
             <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-workshop-muted">
               Bezug: {title}
               {parts.length > 0 ? ` · ${parts.length} Teil(e)` : ""}
             </div>
-            {previewUrl && (
+            {showConceptPreview && previewUrl && (
               <img
                 src={previewUrl}
                 alt="Konzept"
@@ -315,6 +354,10 @@ export function RequirementsConfirmPanel({
       </div>
 
       {summary && <p className="mb-2 text-[11px] leading-snug text-workshop-text">{summary}</p>}
+
+      {(escalation.reference_asset_ids?.length ?? 0) > 0 && (
+        <ReferenceUploadGallery assetIds={escalation.reference_asset_ids!.filter(Boolean)} />
+      )}
 
       {qa.length > 0 && (
         <details className="mb-2 rounded-md border border-workshop-border/60 p-2 text-[11px] text-workshop-muted">

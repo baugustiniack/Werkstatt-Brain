@@ -1,9 +1,10 @@
 """AI Vision Ingestion Pipeline – multimodale Klassifizierung von Fotos und
 Dokumenten (SPEC Kap. 2.3.2).
 
-Bilder (PNG/JPG/…): ausschließlich OpenAI Vision (`OPENAI_API_KEY` / UI-Setting) –
-Nutzer-Feedback: Anthropic Vision funktioniert hier nicht zuverlässig.
-Dokumente/CAD: Text-LLM (Anthropic oder Cursor) über `analyze_document_file`.
+Bilder (PNG/JPG/…): Bild→Text über Cursor (bevorzugt) oder Anthropic via
+`agents.llm_client`. OpenAI Vision nur als letzter Fallback, wenn kein Cursor/
+Anthropic verfügbar ist – spart OpenAI-Guthaben.
+Dokumente/CAD: Text-LLM (Cursor oder Anthropic) über `analyze_document_file`.
 
 Ohne passenden Key greift eine dateinamen-basierte Heuristik als Fallback.
 """
@@ -142,6 +143,41 @@ def _call_anthropic_vision(image_bytes: bytes, media_type: str) -> dict[str, Any
     )
     text = "".join(block.text for block in message.content if hasattr(block, "text"))
     return _extract_json_object(text)
+
+
+def _call_vision_llm(
+    image_bytes: bytes,
+    media_type: str,
+    *,
+    hint: str | None = None,
+    user_notes: str | None = None,
+) -> dict[str, Any]:
+    """Bild→Text-JSON über llm_client (Cursor zuerst)."""
+    from agents.llm_client import call_llm_json
+
+    hint_text = f"\nZusatzhinweis zur Klassifizierung: {hint}" if hint else ""
+    user_text = ""
+    if user_notes and user_notes.strip():
+        user_text = (
+            f"\n\nNutzer-Beschreibung (MUSS in die KI-Beschreibung einbezogen werden):\n"
+            f"{user_notes.strip()}"
+        )
+    user_prompt = (
+        "Analysiere dieses Inventar-Bild und liefere das JSON. "
+        "description muss ausführlich und nicht leer sein."
+        f"{hint_text}{user_text}"
+    )
+    raw = call_llm_json(
+        _VISION_SYSTEM_PROMPT,
+        user_prompt,
+        max_tokens=1500,
+        images=[(image_bytes, media_type)],
+    )
+    description = str(raw.get("description") or "").strip()
+    if not description:
+        raise RuntimeError("Vision-LLM lieferte JSON ohne description (Pflichtfeld).")
+    raw["description"] = description
+    return raw
 
 
 def _call_openai_vision(
@@ -360,7 +396,7 @@ def _preserve_protected_tags(existing: list[str] | None, incoming: list[str] | N
 
 
 def _heuristic_fallback(file_path: str) -> dict[str, Any]:
-    """Dateinamen-basierte Heuristik, solange kein OpenAI-Vision-Key konfiguriert ist."""
+    """Dateinamen-basierte Heuristik, solange kein Cursor-/Anthropic-Key für Bildanalyse da ist."""
     stem = Path(file_path).stem.lower()
     name = Path(file_path).name.lower()
 
@@ -387,16 +423,16 @@ def _heuristic_fallback(file_path: str) -> dict[str, Any]:
         "material_type": material_type,
         "estimated_dimensions": {},
         "description": (
-            f"Automatische Heuristik (kein OpenAI-API-Key für Bildanalyse) für Datei "
-            f"'{Path(file_path).name}'. Bitte unter Einstellungen einen OpenAI-Key hinterlegen "
+            f"Automatische Heuristik (kein Cursor-/Anthropic-Key für Bildanalyse) für Datei "
+            f"'{Path(file_path).name}'. Bitte unter Einstellungen einen Cursor-API-Key hinterlegen "
             f"und „KI beschreiben“ erneut ausführen."
         ),
         "tags": tags,
     }
 
 def is_vision_configured() -> bool:
-    """Bildanalyse erfordert einen OpenAI-API-Key (Nutzer-Feedback)."""
-    return bool(settings_store.resolve_openai_api_key())
+    """Bild→Text: Cursor oder Anthropic (OpenAI nur Fallback in der Kette)."""
+    return settings_store.is_vision_configured()
 
 
 # Eine Vision-Analyse gleichzeitig – verhindert OOM / Host-Freeze
@@ -444,10 +480,10 @@ def analyze_asset_image(
     classification_hint: str | None = None,
     user_notes: str | None = None,
 ) -> VisionIngestResult:
-    """Analysiert ein Bild ausschließlich per OpenAI Vision."""
+    """Analysiert ein Bild per Cursor/Anthropic (Bild→Text), nicht primär OpenAI."""
     path = Path(file_path)
 
-    if not settings_store.resolve_openai_api_key():
+    if not settings_store.is_vision_configured():
         return VisionIngestResult(**_heuristic_fallback(file_path))
 
     with _VISION_SEM:
@@ -467,7 +503,7 @@ def analyze_asset_image(
         last_error: Exception | None = None
         for attempt in range(2):
             try:
-                raw_result = _call_openai_vision(
+                raw_result = _call_vision_llm(
                     image_bytes,
                     media_type,
                     hint=classification_hint,
@@ -477,7 +513,7 @@ def analyze_asset_image(
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 logger.warning(
-                    "OpenAI-Vision-Analyse fehlgeschlagen für %s (Versuch %s): %s",
+                    "Vision-Analyse fehlgeschlagen für %s (Versuch %s): %s",
                     file_path,
                     attempt + 1,
                     exc,
@@ -486,8 +522,8 @@ def analyze_asset_image(
         return VisionIngestResult(
             category="unknown",
             description=(
-                f"OpenAI-Bildanalyse für '{path.name}' fehlgeschlagen "
-                f"({last_error}). Bitte erneut „KI beschreiben“ versuchen oder die Beschreibung manuell ergänzen."
+                f"KI-Bildanalyse für '{path.name}' fehlgeschlagen "
+                f"({last_error}). Cursor-Key prüfen und „KI beschreiben“ erneut versuchen."
             ),
             tags=["vision_error"],
         )

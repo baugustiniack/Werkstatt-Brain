@@ -105,20 +105,27 @@ def _ensure_complexity(state: AgentState) -> AgentState | None:
         {
             "concept_complexity": state.get("concept_complexity"),
             "concept_roster": state.get("concept_roster"),
+            "concept_roster_mode": state.get("concept_roster_mode"),
             "concept_complexity_reasons": state.get("concept_complexity_reasons"),
             "concept_complexity_score": state.get("concept_complexity_score"),
+            "concept_mode": state.get("concept_mode"),
         },
         fresh,
     )
     if (
         merged.get("concept_complexity") == state.get("concept_complexity")
         and list(merged.get("concept_roster") or []) == list(state.get("concept_roster") or [])
+        and merged.get("concept_mode") == state.get("concept_mode")
+        and merged.get("concept_roster_mode") == state.get("concept_roster_mode")
     ):
         return None
     reasons = merged.get("concept_complexity_reasons") or []
     roster = merged.get("concept_roster") or []
+    mode = merged.get("concept_mode")
+    source = merged.get("concept_roster_source") or merged.get("concept_roster_mode") or "supervisor"
     note = (
-        f"Komplexität {merged.get('concept_complexity')} → Roster: {', '.join(roster) or '(leer)'}"
+        f"Komplexität {merged.get('concept_complexity')} → Roster ({source}): {', '.join(roster) or '(leer)'}"
+        + (f" [{mode}]" if mode else "")
         + (f" ({'; '.join(reasons[:4])})" if reasons else "")
     )
     logger.info("Supervisor: %s", note)
@@ -145,7 +152,7 @@ def _overlay_for_disabled_agents(state: AgentState) -> AgentState:
         overlay["flexible_consulted"] = True
     if not is_agent_enabled("interior_architect") or not agent_in_roster(overlay, "interior_architect"):
         overlay["interior_consulted"] = True
-    if not is_agent_enabled("concept_critic"):
+    if not is_agent_enabled("concept_critic") or not agent_in_roster(overlay, "concept_critic"):
         overlay["concept_critiqued"] = True
         overlay["concept_open_points_cleared"] = True
     # Jury komplett deaktiviert → Panel als erledigt markieren (Freigabe setzt _panel_phase_updates)
@@ -179,13 +186,17 @@ def _overlay_for_disabled_agents(state: AgentState) -> AgentState:
                 "reason": "inventory_manager disabled",
             },
         }
-    # V&V aus
+    # V&V aus (global) oder nur Konzept-Phase überspringen (Roster)
     if not is_agent_enabled("vv_manager"):
         overlay["vv_consulted_phases"] = ["concept", "design", "manufacturing"]
         overlay["vv_needs_alignment"] = False
         if overlay.get("escalation_reason") in {"requirements_approval", "requirements_question", "requirements_confirm"}:
             overlay["human_approval_required"] = False
             overlay["escalation_reason"] = None
+    elif not agent_in_roster(overlay, "vv_manager"):
+        consulted = list(overlay.get("vv_consulted_phases") or [])
+        if "concept" not in consulted:
+            overlay["vv_consulted_phases"] = [*consulted, "concept"]
     # Human-Eskalation aus → Konzept auto-freigeben wenn nötig
     if not is_agent_enabled("human_escalation"):
         if overlay.get("escalation_reason") == "concept_approval" or (
@@ -418,11 +429,19 @@ def _compute_next_route(state: AgentState) -> str:
         }
 
     # 1) Flexible Specialist (optional)
-    if not effective.get("flexible_consulted") and is_agent_enabled("flexible_specialist"):
+    if (
+        not effective.get("flexible_consulted")
+        and is_agent_enabled("flexible_specialist")
+        and agent_in_roster(effective, "flexible_specialist")
+    ):
         return "flexible_specialist"
 
     # 1a) Innenarchitekt (Raumkonzept / Ansichten / Grundriss)
-    if not effective.get("interior_consulted") and is_agent_enabled("interior_architect"):
+    if (
+        not effective.get("interior_consulted")
+        and is_agent_enabled("interior_architect")
+        and agent_in_roster(effective, "interior_architect")
+    ):
         return "interior_architect"
 
     # 1b) Leer-Agenten (Guidance-only, optional)
@@ -441,7 +460,7 @@ def _compute_next_route(state: AgentState) -> str:
         }:
             if is_agent_enabled("human_escalation"):
                 return "human_escalation"
-        if is_agent_enabled("vv_manager"):
+        if is_agent_enabled("vv_manager") and agent_in_roster(effective, "vv_manager"):
             return "vv_manager"
         consulted = list(dict.fromkeys([*consulted, "concept", "design", "manufacturing"]))
 
@@ -459,7 +478,7 @@ def _compute_next_route(state: AgentState) -> str:
     ):
         if is_agent_enabled("human_escalation"):
             return "human_escalation"
-        if is_agent_enabled("concept_critic"):
+        if is_agent_enabled("concept_critic") and agent_in_roster(effective, "concept_critic"):
             return "concept_critic"
 
     # 3b) Konzept-Jury (Konsens) vor User-Freigabe
@@ -472,6 +491,7 @@ def _compute_next_route(state: AgentState) -> str:
             effective.get("requirements_contract")
             and not effective.get("concept_critiqued")
             and is_agent_enabled("concept_critic")
+            and agent_in_roster(effective, "concept_critic")
         ):
             return "concept_critic"
         queue = list(effective.get("concept_panel_queue") or [])

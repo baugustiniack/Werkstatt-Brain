@@ -236,6 +236,9 @@ def _build_view_prompt(
         if isinstance(spatial, list) and spatial:
             room_summary += " " + "; ".join(str(s) for s in spatial[:4])
         vision_brief = str(interior_brief.get("reference_vision_brief") or "")[:1800]
+        rev = str(interior_brief.get("layout_revision_note") or "").strip()
+        if rev:
+            room_summary = f"{room_summary} | REVISION: {rev}".strip(" |")
 
     prompt_excerpt = (user_prompt or "")[:1800]
     materials: list[str] = []
@@ -519,6 +522,46 @@ def generate_concept_gallery(
 
     logger.info("Konzept-Galerie fertig: %s Ansicht(en) für session=%s", len(results), session_id)
     return results
+
+
+def generate_concept_gallery_from_state(state: dict[str, Any]) -> tuple[str | None, list[dict[str, Any]]]:
+    """On-demand Galerie aus Workflow-State (Nutzer-Freigabe „Visualisieren“)."""
+    from agents.nodes.interior_architect import enrich_interior_views_from_parts
+    from agents.reference_images import resolve_reference_asset_ids
+
+    session_id = str(state.get("session_id") or "anonymous")
+    contract = state.get("requirements_contract") if isinstance(state.get("requirements_contract"), dict) else {}
+    parts = contract.get("parts") or []
+    if not isinstance(parts, list) or not parts:
+        return None, []
+
+    ref_ids = resolve_reference_asset_ids(state)  # type: ignore[arg-type]
+    brief_text = str(state.get("reference_vision_brief") or "")
+    interior = state.get("interior_brief") if isinstance(state.get("interior_brief"), dict) else {}
+    if ref_ids or brief_text:
+        interior = {**interior, "need_floorplan": True, "is_room_concept": True}
+    feedback_text = str(state.get("last_concept_feedback") or "")
+    if feedback_text:
+        interior = {
+            **interior,
+            "layout_revision_note": (
+                "SICHTBARE NEUANORDNUNG erforderlich. Feedback: " + feedback_text[:500]
+            ),
+        }
+    room_plan = enrich_interior_views_from_parts(dict(interior or {}), parts)
+    gallery = generate_concept_gallery(
+        session_id=session_id,
+        project_title=str(contract.get("project_title") or "Konzept"),
+        user_prompt=str(state.get("user_prompt") or ""),
+        parts=parts,
+        views=room_plan.get("suggested_views"),
+        interior_brief={**room_plan, "reference_vision_brief": brief_text},
+        max_images=5,
+        asset_ids=ref_ids or None,
+    )
+    gallery = ensure_gallery_urls(session_id, gallery)
+    primary = gallery[0]["url"] if gallery else None
+    return primary, gallery
 
 
 def generate_concept_image(

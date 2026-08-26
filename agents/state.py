@@ -102,8 +102,11 @@ class AgentState(TypedDict, total=False):
     # Supervisor-Roster nach Komplexität (low|medium|high)
     concept_complexity: str
     concept_roster: list[str]
+    concept_roster_mode: str  # auto | manual
+    concept_roster_source: str  # supervisor | manual
     concept_complexity_reasons: list[str]
     concept_complexity_score: int
+    concept_mode: str  # "layout" | "manufacturing"
 
     # --- V&V / Flexible / Fertigung ---
     # vv_requirements: phasenweise Requirements (concept → design → manufacturing)

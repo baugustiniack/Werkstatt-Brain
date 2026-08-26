@@ -18,6 +18,7 @@ from app.services import settings_store
 router = APIRouter(prefix="/api/v1/settings", tags=["settings"])
 
 ProviderChoice = Literal["auto", "anthropic", "cursor"]
+ConceptRosterMode = Literal["auto", "manual"]
 
 
 class ApiKeyStatusResponse(BaseModel):
@@ -25,7 +26,11 @@ class ApiKeyStatusResponse(BaseModel):
     openai_configured: bool
     cursor_configured: bool
     llm_provider: ProviderChoice
-    active_provider: str  # effektiver Provider nach Auto-Auflösung: anthropic|cursor|none
+    active_provider: str  # effektiver Provider: cursor|anthropic|none
+    vision_configured: bool
+    concept_roster_mode: ConceptRosterMode
+    concept_roster_agents: list[str]
+    concept_roster_selectable: list[str]
 
 
 class ApiKeyUpdateRequest(BaseModel):
@@ -34,6 +39,12 @@ class ApiKeyUpdateRequest(BaseModel):
     cursor_api_key: str | None = Field(None, description="Leerstring/None löscht den hinterlegten Key wieder.")
     llm_provider: ProviderChoice | None = Field(
         None, description="Bevorzugter Provider: auto | anthropic | cursor"
+    )
+    concept_roster_mode: ConceptRosterMode | None = Field(
+        None, description="Konzept-Roster: auto (Supervisor) | manual (Nutzer-Auswahl)"
+    )
+    concept_roster_agents: list[str] | None = Field(
+        None, description="Agent-IDs für manuelles Konzept-Roster"
     )
 
 
@@ -47,6 +58,10 @@ def _status_response() -> ApiKeyStatusResponse:
         cursor_configured=settings_store.is_cursor_configured(),
         llm_provider=preferred,  # type: ignore[arg-type]
         active_provider=settings_store.resolve_llm_provider(),
+        vision_configured=settings_store.is_vision_configured(),
+        concept_roster_mode=settings_store.resolve_concept_roster_mode(),  # type: ignore[arg-type]
+        concept_roster_agents=settings_store.resolve_manual_concept_roster(),
+        concept_roster_selectable=list(settings_store.CONCEPT_ROSTER_SELECTABLE),
     )
 
 
@@ -65,5 +80,16 @@ def update_api_keys(request: ApiKeyUpdateRequest) -> ApiKeyStatusResponse:
         settings_store.set_setting(settings_store.CURSOR_API_KEY_SETTING, request.cursor_api_key.strip() or None)
     if request.llm_provider is not None:
         settings_store.set_setting(settings_store.LLM_PROVIDER_SETTING, request.llm_provider)
+    if request.concept_roster_mode is not None:
+        settings_store.set_setting(settings_store.CONCEPT_ROSTER_MODE_SETTING, request.concept_roster_mode)
+    if request.concept_roster_agents is not None:
+        import json
+
+        allowed = set(settings_store.CONCEPT_ROSTER_SELECTABLE)
+        picked = [aid for aid in request.concept_roster_agents if aid in allowed]
+        settings_store.set_setting(
+            settings_store.CONCEPT_ROSTER_AGENTS_SETTING,
+            json.dumps(picked) if picked else None,
+        )
 
     return _status_response()

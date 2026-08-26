@@ -107,42 +107,90 @@ def _pending_questions(questions: list[str], answers: list[dict[str, Any]]) -> l
     return cleaned[idx:]
 
 
+def _decision_is_visualize(decision: object) -> bool:
+    if not isinstance(decision, dict):
+        return False
+    return str(decision.get("decision") or "").strip().lower() == "visualize"
+
+
 def _handle_concept_approval(state: AgentState) -> AgentState:
     session_id = str(state.get("session_id") or "anonymous")
+    gallery = list(state.get("concept_image_urls") or [])
     try:
         from app.services.concept_image import ensure_gallery_urls
 
-        gallery = ensure_gallery_urls(session_id, state.get("concept_image_urls") or [])
+        gallery = ensure_gallery_urls(session_id, gallery)
     except Exception:  # noqa: BLE001
-        gallery = list(state.get("concept_image_urls") or [])
+        pass
 
     primary = state.get("concept_image_url") or (gallery[0]["url"] if gallery else None)
-    payload = {
-        "reason": "concept_approval",
-        "session_id": session_id,
-        "requirements_contract": state.get("requirements_contract"),
-        "concept_sketch_svg": state.get("concept_sketch_svg"),
-        "concept_image_url": primary,
-        "concept_image_urls": gallery,
-        "reference_asset_ids": state.get("reference_asset_ids") or [],
-        "coherence_critique": state.get("coherence_critique"),
-        "vv_requirements": state.get("vv_requirements"),
-        "concept_panel_grades": state.get("concept_panel_grades") or [],
-        "concept_panel_average": state.get("concept_panel_average"),
-        "concept_panel_passed": bool(state.get("concept_panel_passed")),
-        "concept_panel_forced": bool(state.get("concept_panel_forced")),
-        "concept_panel_reverted": bool(state.get("concept_panel_reverted")),
-        "concept_panel_round": state.get("concept_panel_round"),
-        "concept_complexity": state.get("concept_complexity"),
-        "concept_roster": state.get("concept_roster") or [],
-        "concept_complexity_reasons": state.get("concept_complexity_reasons") or [],
-        "iteration_count": state.get("iteration_count", 0),
-    }
+    sketch_svg = state.get("concept_sketch_svg")
+
+    def _build_payload(
+        *,
+        image_url: str | None,
+        image_urls: list[dict[str, Any]],
+        visualize_error: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "reason": "concept_approval",
+            "session_id": session_id,
+            "requirements_contract": state.get("requirements_contract"),
+            "concept_sketch_svg": sketch_svg,
+            "concept_image_url": image_url,
+            "concept_image_urls": image_urls,
+            "reference_asset_ids": _escalation_reference_asset_ids(state),
+            "coherence_critique": state.get("coherence_critique"),
+            "vv_requirements": state.get("vv_requirements"),
+            "concept_panel_grades": state.get("concept_panel_grades") or [],
+            "concept_panel_average": state.get("concept_panel_average"),
+            "concept_panel_passed": bool(state.get("concept_panel_passed")),
+            "concept_panel_forced": bool(state.get("concept_panel_forced")),
+            "concept_panel_reverted": bool(state.get("concept_panel_reverted")),
+            "concept_panel_round": state.get("concept_panel_round"),
+            "concept_complexity": state.get("concept_complexity"),
+            "concept_roster": state.get("concept_roster") or [],
+            "concept_complexity_reasons": state.get("concept_complexity_reasons") or [],
+            "iteration_count": state.get("iteration_count", 0),
+            "visualize_error": visualize_error,
+        }
+
+    payload = _build_payload(image_url=primary, image_urls=gallery)
     logger.info(
-        "Human Escalation: Konzept-Freigabe mit %s Galerie-Bild(ern)",
+        "Human Escalation: Konzept-Freigabe (SVG=%s, Galerie=%s Bild(er))",
+        bool(sketch_svg),
         len(payload["concept_image_urls"] or []),
     )
+
     decision = interrupt(payload)
+    while _decision_is_visualize(decision):
+        from app.services import settings_store
+        from app.services.concept_image import generate_concept_gallery_from_state
+
+        if not settings_store.resolve_openai_api_key():
+            payload = _build_payload(
+                image_url=primary,
+                image_urls=gallery,
+                visualize_error="Kein OpenAI-API-Key – unter Einstellungen hinterlegen.",
+            )
+            decision = interrupt(payload)
+            continue
+        try:
+            primary, gallery = generate_concept_gallery_from_state(state)
+            if not gallery:
+                err = "Visualisierung lieferte keine Bilder (OpenAI-Aufruf fehlgeschlagen?)."
+                payload = _build_payload(image_url=primary, image_urls=gallery, visualize_error=err)
+            else:
+                payload = _build_payload(image_url=primary, image_urls=gallery, visualize_error=None)
+                logger.info("Konzept visualisiert: %s Ansicht(en)", len(gallery))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Konzept-Visualisierung fehlgeschlagen: %s", exc)
+            payload = _build_payload(
+                image_url=primary,
+                image_urls=gallery,
+                visualize_error=f"Visualisierung fehlgeschlagen: {exc}",
+            )
+        decision = interrupt(payload)
 
     if _decision_is_revise(decision):
         from agents.concept_panel import MAX_PANEL_ROUNDS, build_revision_feedback, grade_label
@@ -187,6 +235,8 @@ def _handle_concept_approval(state: AgentState) -> AgentState:
             "panel_reviewer_id": None,
             "last_user_grade": user_grade,
             "coherence_critique": None,
+            "concept_image_url": None,
+            "concept_image_urls": [],
             "current_agent": "human_escalation",
             "refinement_request": {
                 "from_agent": "human",
@@ -217,6 +267,8 @@ def _handle_concept_approval(state: AgentState) -> AgentState:
         "escalation_reason": None,
         "iteration_count": 0,
         "concept_approved": True,
+        "concept_image_url": primary,
+        "concept_image_urls": gallery,
         "current_agent": "human_escalation",
         "messages": [{"role": "system", "content": "[Human Escalation] Entwurf freigegeben – Ausarbeitung startet."}],
         "agent_transcript": [
@@ -229,6 +281,13 @@ def _handle_concept_approval(state: AgentState) -> AgentState:
             )
         ],
     }
+
+
+def _escalation_reference_asset_ids(state: AgentState) -> list[str]:
+    """Chat-/Upload-Referenzen für Klärungs-UI (aus State oder Prompt)."""
+    from agents.reference_images import resolve_reference_asset_ids
+
+    return resolve_reference_asset_ids(state)[:8]
 
 
 def _handle_requirements_approval(state: AgentState) -> AgentState:
@@ -258,6 +317,7 @@ def _handle_requirements_approval(state: AgentState) -> AgentState:
             "draft_title": vv.get("title"),
             "draft_summary": vv.get("summary"),
             "phase": phase,
+            "reference_asset_ids": _escalation_reference_asset_ids(state),
             "vv_requirements": {
                 "title": vv.get("title"),
                 "phase": phase,
@@ -377,6 +437,7 @@ def _handle_requirements_confirm(state: AgentState) -> AgentState:
         "qa_answers": answers,
         "summary": vv.get("summary"),
         "phase": phase,
+        "reference_asset_ids": _escalation_reference_asset_ids(state),
         "iteration_count": state.get("iteration_count", 0),
         "requirements_contract": state.get("requirements_contract"),
     }
@@ -540,7 +601,7 @@ def _handle_concept_clarification(state: AgentState) -> AgentState:
             },
             "concept_image_url": state.get("concept_image_url"),
             "concept_image_urls": gallery,
-            "reference_asset_ids": (state.get("reference_asset_ids") or [])[:8],
+            "reference_asset_ids": _escalation_reference_asset_ids(state),
             "requirements_contract": lean_contract,
             "iteration_count": state.get("iteration_count", 0),
         }

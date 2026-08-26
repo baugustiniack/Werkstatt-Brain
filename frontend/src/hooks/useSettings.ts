@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api } from "../api/client";
-import type { ApiKeyStatusResponse, LlmProviderChoice } from "../api/types";
+import type { ApiKeyStatusResponse, ConceptRosterMode, LlmProviderChoice } from "../api/types";
 
 /** UI-verwaltete API-Key-Einstellungen (Nutzer-Feedback: Key flexibel per
  * Eingabefeld statt nur über .env pflegen können). */
@@ -20,6 +20,8 @@ export function useUpdateApiKeys() {
       openai_api_key?: string | null;
       cursor_api_key?: string | null;
       llm_provider?: LlmProviderChoice;
+      concept_roster_mode?: ConceptRosterMode;
+      concept_roster_agents?: string[];
     }) => api.post<ApiKeyStatusResponse>("/api/v1/settings/api-keys", body),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["api-key-status"] }),
   });

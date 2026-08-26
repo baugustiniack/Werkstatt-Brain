@@ -16,6 +16,9 @@ import { StatusBadge } from "../layout/StatusBadge";
 import type { ReferenceMediaPreview } from "../modelViewer/ModelViewer";
 import { ReferenceUpload } from "../commandCenter/ReferenceUpload";
 import { ClarificationPanel, RequirementsConfirmPanel } from "../agentTrace/EscalationDialog";
+import { ConceptRosterPicker } from "./ConceptRosterPicker";
+import { useApiKeyStatus } from "../../hooks/useSettings";
+import type { ConceptRosterMode } from "../../api/types";
 import { assetFileUrl } from "../inventory/AssetPreview";
 
 const ACTIVE_CONV_KEY = "werkstatt.activeConversationId";
@@ -119,6 +122,8 @@ function ConceptImageCard({
   title,
   imageUrl,
   imageUrls,
+  sketchSvg,
+  visualizeError,
   sessionId,
   referenceAssetIds,
   coherenceCritique,
@@ -138,6 +143,8 @@ function ConceptImageCard({
   title: string;
   imageUrl: string | null;
   imageUrls?: Array<{ url: string; label?: string; kind?: string }> | null;
+  sketchSvg?: string | null;
+  visualizeError?: string | null;
   /** CAD-Session – Fallback, Galerie von Disk nachladen */
   sessionId?: string | null;
   referenceAssetIds?: string[] | null;
@@ -246,11 +253,24 @@ function ConceptImageCard({
         </div>
         <span
           className="shrink-0 rounded border border-workshop-border px-1.5 py-0.5 text-[10px] text-workshop-muted"
-          title="Automatisch in Inventar-DB gespeichert"
+          title={gallery.length > 0 ? "KI-Galerie generiert" : "Vektor-Skizze aus Teileliste"}
         >
-          KI-Generiert
+          {gallery.length > 0 ? "KI-Visualisierung" : "SVG-Entwurf"}
         </span>
       </div>
+
+      {gallery.length === 0 && (
+        <p className="mb-2 text-[11px] leading-snug text-workshop-muted">
+          Zuerst die Skizze prüfen. Optional per OpenAI visualisieren – sonst direkt nächste Runde oder
+          Freigabe.
+        </p>
+      )}
+
+      {visualizeError && (
+        <p className="mb-2 rounded border border-workshop-danger/40 bg-workshop-danger/10 px-2 py-1 text-[11px] text-workshop-danger">
+          {visualizeError}
+        </p>
+      )}
 
       {gallery.length > 1 && (
         <p className="mb-2 text-[11px] leading-snug text-workshop-muted">
@@ -412,11 +432,13 @@ function ConceptImageCard({
             </div>
           )}
         </div>
+      ) : sketchSvg ? (
+        <div className="mb-3 max-h-72 overflow-auto rounded-md border border-workshop-border bg-white p-2">
+          <div dangerouslySetInnerHTML={{ __html: sketchSvg }} />
+        </div>
       ) : (
         <div className="mb-3 flex max-h-48 min-h-32 items-center justify-center rounded-md border border-dashed border-workshop-border bg-black/20 p-4 text-center text-xs text-workshop-muted">
-          Kein Raumfoto verfügbar – bitte einen{" "}
-          <strong className="text-workshop-text">OpenAI-Key</strong> unter Einstellungen hinterlegen
-          (Images API). Unten die technische Teileliste.
+          Keine Skizze verfügbar – Teileliste unten prüfen.
         </div>
       )}
 
@@ -502,10 +524,19 @@ function ConceptImageCard({
           ) : (
             <div className="flex flex-col gap-2">
               <p className="text-[11px] leading-snug text-workshop-muted">
-                Du entscheidest: Konzept freigeben und ausarbeiten lassen, oder eine weitere Runde mit
-                Agenten-Feedback (und optional deiner eigenen Note) starten.
+                Du entscheidest: optional visualisieren (OpenAI, kostet Guthaben), nächste Runde mit
+                Agenten-Feedback, oder freigeben und ausarbeiten lassen.
               </p>
-              <div className="flex justify-end gap-2">
+              <div className="flex flex-wrap justify-end gap-2">
+                {gallery.length === 0 && (
+                  <button
+                    type="button"
+                    onClick={() => onDecision({ decision: "visualize" })}
+                    className="rounded-md border border-workshop-accent px-3 py-1.5 text-xs font-semibold text-workshop-accent hover:bg-workshop-accent/10"
+                  >
+                    Visualisieren
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => setMode("revise")}
@@ -517,7 +548,7 @@ function ConceptImageCard({
                   type="button"
                   onClick={() => onDecision({ decision: "approve" })}
                   className="rounded-md bg-workshop-accent px-3 py-1.5 text-xs font-semibold text-workshop-bg"
-                  title="Gibt das Gesamt-Konzept frei (Maßgeblich = Raumsituation), nicht einzelne Thumbnails"
+                  title="Gibt das Gesamt-Konzept frei, nicht einzelne Thumbnails"
                 >
                   Konzept freigeben
                 </button>
@@ -570,9 +601,18 @@ export function ConversationPanel({
   const { data: detail, isFetching: detailFetching } = useConversation(activeConversationId);
   const createConv = useCreateConversation();
   const deleteConv = useDeleteConversation();
+  const { data: settingsStatus } = useApiKeyStatus();
   const [pendingDelete, setPendingDelete] = useState<{ id: string; title: string } | null>(null);
   const [attachContext, setAttachContext] = useState("");
   const [attachClearToken, setAttachClearToken] = useState(0);
+  const [conceptRosterMode, setConceptRosterMode] = useState<ConceptRosterMode>("auto");
+  const [conceptRosterAgents, setConceptRosterAgents] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (!settingsStatus) return;
+    setConceptRosterMode(settingsStatus.concept_roster_mode ?? "auto");
+    setConceptRosterAgents(settingsStatus.concept_roster_agents ?? []);
+  }, [settingsStatus?.concept_roster_mode, settingsStatus?.concept_roster_agents]);
 
   const isBusy = cad.status === "connecting" || cad.status === "running" || cad.status === "escalation";
 
@@ -729,6 +769,10 @@ export function ConversationPanel({
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
     if (isBusy || prompt.trim().length < 3) return;
+    if (conceptRosterMode === "manual" && conceptRosterAgents.length === 0) {
+      window.alert("Bitte mindestens einen Konzept-Agenten wählen oder „Supervisor entscheidet“ aktivieren.");
+      return;
+    }
     let text = [prompt.trim(), attachContext.trim()].filter(Boolean).join("\n\n");
     // Client-Schutz: gleiche Grenze wie Backend (50k)
     if (text.length > 50_000) {
@@ -758,7 +802,11 @@ export function ConversationPanel({
     invalidateConversation(qc, convId);
 
     // 2) CAD starten ohne zweite User-Message in der DB
-    await cad.start(text, convId, { persistUserMessage: false });
+    await cad.start(text, convId, {
+      persistUserMessage: false,
+      conceptRosterMode,
+      conceptRoster: conceptRosterMode === "manual" ? conceptRosterAgents : undefined,
+    });
     invalidateConversation(qc, convId);
   };
 
@@ -1002,6 +1050,8 @@ export function ConversationPanel({
                 title={liveTitle}
                 imageUrl={liveImageUrl}
                 imageUrls={liveImageUrls}
+                sketchSvg={cad.escalation?.concept_sketch_svg ?? cad.conceptSketchSvg}
+                visualizeError={cad.escalation?.visualize_error}
                 sessionId={cad.escalation?.session_id ?? cad.sessionId}
                 referenceAssetIds={liveRefIds}
                 coherenceCritique={liveCritique}
@@ -1064,6 +1114,20 @@ export function ConversationPanel({
           onSubmit={(e) => void handleSubmit(e)}
           className="flex max-h-[46%] min-h-0 shrink-0 flex-col gap-2 border-t border-workshop-border pt-3"
         >
+          <div className="rounded-md border border-workshop-border/80 bg-workshop-bg/30 px-2 py-2">
+            <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-workshop-muted">
+              Konzept-Agenten (dieser Lauf)
+            </div>
+            <ConceptRosterPicker
+              compact
+              mode={conceptRosterMode}
+              agents={conceptRosterAgents}
+              selectable={settingsStatus?.concept_roster_selectable}
+              onModeChange={setConceptRosterMode}
+              onAgentsChange={setConceptRosterAgents}
+              disabled={isBusy}
+            />
+          </div>
           <div className="min-h-0 overflow-y-auto">
             <ReferenceUpload
               onContextChange={setAttachContext}
